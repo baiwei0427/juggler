@@ -175,9 +175,8 @@ out:
 	return segs;
 }
 
-bool tcp_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+struct sk_buff **tcp_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 {
-	struct sk_buff **head = &napi->gro_list;
 	struct sk_buff **pp = NULL;
 	struct sk_buff *p, *p2, *p3, *p4, *p_next;
 	struct tcphdr *th;
@@ -645,7 +644,7 @@ int tcp_gro_complete(struct sk_buff *skb)
 }
 EXPORT_SYMBOL(tcp_gro_complete);
 
-static bool tcp4_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+static struct sk_buff **tcp4_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 {
 	/* Don't bother verifying checksum if we're going to flush anyway. */
 	if (!NAPI_GRO_CB(skb)->flush &&
@@ -655,7 +654,7 @@ static bool tcp4_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 		return NULL;
 	}
 
-	return tcp_gro_receive(napi, skb);
+	return tcp_gro_receive(head, skb);
 }
 
 static int tcp4_gro_complete(struct sk_buff *skb, int thoff)
