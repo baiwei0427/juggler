@@ -1,0 +1,1510 @@
+diff -Naur linux-3.18.5/include/linux/netdevice.h linux-3.18.5-juggler/include/linux/netdevice.h
+--- linux-3.18.5/include/linux/netdevice.h	2015-01-30 09:41:03.000000000 +0800
++++ linux-3.18.5-juggler/include/linux/netdevice.h	2016-09-09 05:45:00.541822353 +0800
+@@ -313,7 +313,12 @@
+ #endif
+ 	struct net_device	*dev;
+ 	struct sk_buff		*gro_list;
++	struct sk_buff_head_gro	*out_of_order_queue_list;
+ 	struct sk_buff		*skb;
++	//struct ktime_t		timestamp;
++	struct hrtimer		timer;
++	struct tasklet_struct	timer_timeout;
++	spinlock_t 			gro_lock;
+ 	struct list_head	dev_list;
+ 	struct hlist_node	napi_hash_node;
+ 	unsigned int		napi_id;
+@@ -1910,7 +1915,25 @@
+ 	__wsum	csum;
+ 
+ 	/* used in skb_gro_receive() slow path */
+-	struct sk_buff *last;
++	//struct sk_buff *last;
++
++	/* out of order queue for tcp */
++	struct sk_buff_head_gro *out_of_order_queue;
++
++	/* the prev/next skb in the out of order queue */
++	struct sk_buff *prev;
++	struct sk_buff *next;
++
++	/* seq and len of tcp data*/
++	__u32 seq;
++	__u32 len;
++
++	/* if this skb is a TCP packet */
++	bool is_tcp;
++	__u32 tcp_hash;
++
++	/* similar to age, for tcp reordering only */
++	u64 timestamp;
+ };
+ 
+ #define NAPI_GRO_CB(skb) ((struct napi_gro_cb *)(skb)->cb)
+@@ -2127,7 +2150,13 @@
+ struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
+ int netdev_get_name(struct net *net, char *name, int ifindex);
+ int dev_restart(struct net_device *dev);
+-int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb);
++//int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb);
++
++int napi_gro_complete(struct sk_buff *skb);
++
++int skb_gro_merge(struct sk_buff *p, struct sk_buff *skb);
++void skb_gro_free(struct sk_buff *skb);
++void skb_gro_flush(struct sk_buff_head_gro *ofo_queue, struct sk_buff *skb);
+ 
+ static inline unsigned int skb_gro_offset(const struct sk_buff *skb)
+ {
+@@ -2834,6 +2863,7 @@
+ int netif_rx(struct sk_buff *skb);
+ int netif_rx_ni(struct sk_buff *skb);
+ int netif_receive_skb(struct sk_buff *skb);
++int netif_receive_skb_internal(struct sk_buff *skb);
+ gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
+ void napi_gro_flush(struct napi_struct *napi, bool flush_old);
+ struct sk_buff *napi_get_frags(struct napi_struct *napi);
+diff -Naur linux-3.18.5/include/linux/skbuff.h linux-3.18.5-juggler/include/linux/skbuff.h
+--- linux-3.18.5/include/linux/skbuff.h	2015-01-30 09:41:03.000000000 +0800
++++ linux-3.18.5-juggler/include/linux/skbuff.h	2016-09-09 05:45:00.541822353 +0800
+@@ -174,6 +174,20 @@
+ 	spinlock_t	lock;
+ };
+ 
++struct sk_buff_head_gro {
++	/* These two members must be first. */
++	struct sk_buff				*next;
++	struct sk_buff				*prev;
++	struct sk_buff_head_gro		*next_queue;
++	struct sk_buff_head_gro		*prev_queue;
++
++	unsigned long 				age;
++	__u32						hash;
++	__u32						qlen;
++	__u32						skb_num;
++	__u32						seq_next;
++};
++
+ struct sk_buff;
+ 
+ /* To allow 64K frame to be packed as single skb without frag_list we
+@@ -522,7 +536,7 @@
+ 	 * want to keep them across layers you have to do a skb_clone()
+ 	 * first. This is owned by whoever has the skb queued ATM.
+ 	 */
+-	char			cb[48] __aligned(8);
++	char			cb[128] __aligned(8);
+ 
+ 	unsigned long		_skb_refdst;
+ 	void			(*destructor)(struct sk_buff *skb);
+diff -Naur linux-3.18.5/net/core/dev.c linux-3.18.5-juggler/net/core/dev.c
+--- linux-3.18.5/net/core/dev.c	2015-01-30 09:41:03.000000000 +0800
++++ linux-3.18.5-juggler/net/core/dev.c	2016-09-09 05:45:11.957822358 +0800
+@@ -102,6 +102,7 @@
+ #include <net/pkt_sched.h>
+ #include <net/checksum.h>
+ #include <net/xfrm.h>
++#include <net/tcp.h>
+ #include <linux/highmem.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
+@@ -3785,7 +3786,7 @@
+ 	return ret;
+ }
+ 
+-static int netif_receive_skb_internal(struct sk_buff *skb)
++int netif_receive_skb_internal(struct sk_buff *skb)
+ {
+ 	net_timestamp_check(netdev_tstamp_prequeue, skb);
+ 
+@@ -3811,6 +3812,7 @@
+ #endif
+ 	return __netif_receive_skb(skb);
+ }
++EXPORT_SYMBOL(netif_receive_skb_internal);
+ 
+ /**
+  *	netif_receive_skb - process receive buffer from network
+@@ -3863,7 +3865,7 @@
+ 	}
+ }
+ 
+-static int napi_gro_complete(struct sk_buff *skb)
++int napi_gro_complete(struct sk_buff *skb)
+ {
+ 	struct packet_offload *ptype;
+ 	__be16 type = skb->protocol;
+@@ -3897,13 +3899,114 @@
+ 	return netif_receive_skb_internal(skb);
+ }
+ 
++static __u32 max_seq(__u32 seq1, __u32 seq2) {
++        if (before(seq1, seq2)) {
++                return seq2;
++        } else {
++                return seq1;
++        }
++}
++
++static struct sk_buff* dev_gro_complete(struct napi_struct *napi, struct sk_buff *skb, u64 timeout) {
++
++	struct sk_buff_head_gro *ofo_queue = NAPI_GRO_CB(skb)->out_of_order_queue;
++	struct sk_buff *p = ofo_queue->next, *p2, *pl = ofo_queue->prev, *skb_last = NULL;
++	unsigned qlen = 0, skb_num = 0;
++	u64 timestamp = ktime_to_ns(ktime_get());
++
++	if (ofo_queue == NULL) {
++		napi_gro_complete(skb);
++		return NULL;
++	}
++
++	if (timeout != 0) {
++		while (pl != NULL) {
++			if (timestamp - NAPI_GRO_CB(pl)->timestamp < timeout) {
++				skb_last = pl;
++				pl = NAPI_GRO_CB(pl)->prev;
++			} else {
++				printk(KERN_NOTICE "age: %u\n", timestamp - NAPI_GRO_CB(pl)->timestamp);
++				break;
++			}
++		}
++	}
++
++	while (p != skb_last) {
++		p2 = NAPI_GRO_CB(p)->next;
++		if (p2)
++			NAPI_GRO_CB(p2)->prev = NULL;
++
++		qlen += NAPI_GRO_CB(p)->len;
++		skb_num++;
++
++		ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
++		ofo_queue->skb_num--;
++		ofo_queue->seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len);
++		napi_gro_complete(p);
++		p = p2;
++	}
++
++	while (p != NULL && !before(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq)) {
++		p2 = NAPI_GRO_CB(p)->next;
++		if (p2)
++			NAPI_GRO_CB(p2)->prev = NULL;
++
++		qlen += NAPI_GRO_CB(p)->len;
++		skb_num++;
++
++		ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
++		ofo_queue->skb_num--;
++		ofo_queue->seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len);
++		napi_gro_complete(p);
++		p = p2;
++		printk(KERN_NOTICE "flush in sequence skb\n");
++	}
++
++	if (p == NULL) {
++		ofo_queue->age = jiffies;
++		ofo_queue->prev_queue = NULL;
++		ofo_queue->next_queue = napi->out_of_order_queue_list;
++		if (napi->out_of_order_queue_list) {
++			napi->out_of_order_queue_list->prev_queue = ofo_queue;
++		}
++		napi->out_of_order_queue_list = ofo_queue;
++	} else {
++		ofo_queue->next = p;
++	}
++
++	if (timeout != 0) {
++		printk(KERN_NOTICE "napi_gro_flush qlen %u skb %u\n", qlen, skb_num);
++	}
++
++	//printk(KERN_ERR "seq_next %u\n", ofo_queue->seq_next);
++
++	return p;
++}
++
++
++void napi_clean_tcp_ofo_queue(struct napi_struct *napi) {
++	struct sk_buff_head_gro *ofo_queue, *ofo_queue2;
++
++	ofo_queue = napi->out_of_order_queue_list;
++	while (ofo_queue) {
++		ofo_queue2 = ofo_queue->next_queue;
++
++		if (jiffies - ofo_queue->age > HZ) {
++			ofo_queue->age = 0;
++			ofo_queue->hash = 0;
++		}
++
++		ofo_queue = ofo_queue2;
++	}
++}
++
+ /* napi->gro_list contains packets ordered by age.
+  * youngest packets at the head of it.
+  * Complete skbs in reverse order to reduce latencies.
+  */
+ void napi_gro_flush(struct napi_struct *napi, bool flush_old)
+ {
+-	struct sk_buff *skb, *prev = NULL;
++	struct sk_buff *skb, *prev = NULL, *gro_list_old = napi->gro_list, *p, *skb_new;
+ 
+ 	/* scan list and build reverse chain */
+ 	for (skb = napi->gro_list; skb != NULL; skb = skb->next) {
+@@ -3911,18 +4014,53 @@
+ 		prev = skb;
+ 	}
+ 
++	napi->gro_list = NULL;
++
+ 	for (skb = prev; skb; skb = prev) {
+-		skb->next = NULL;
++		//skb->next = NULL;
+ 
+-		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies)
++		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies) {
++			napi->gro_list = gro_list_old;
+ 			return;
++		}
+ 
+ 		prev = skb->prev;
+-		napi_gro_complete(skb);
+-		napi->gro_count--;
++
++		if (!NAPI_GRO_CB(skb)->out_of_order_queue) {
++
++			if (prev != NULL) {
++				prev->next = skb->next;
++			}
++
++			skb->prev = NULL;
++			skb->next = NULL;
++			dev_gro_complete(napi, skb, 0);
++			napi->gro_count--;
++		} else {
++			
++			p = skb->next;
++			skb_new = dev_gro_complete(napi, skb, 100000);
++			if (!skb_new) {
++				if (prev != NULL) {
++					prev->next = p;
++				}
++
++				napi->gro_count--;
++			} else {
++				if (prev != NULL) {
++					prev->next = skb_new;
++				}
++				skb_new->next = p;
++				napi->gro_list = skb_new;
++			}
++		}
+ 	}
+ 
+-	napi->gro_list = NULL;
++	if (napi->gro_list) {
++		hrtimer_start(&napi->timer, ktime_set(0, 1E5), HRTIMER_MODE_REL_PINNED);
++	}
++
++	//napi->gro_list = NULL;
+ }
+ EXPORT_SYMBOL(napi_gro_flush);
+ 
+@@ -3993,6 +4131,27 @@
+ 	}
+ }
+ 
++static struct sk_buff_head_gro* napi_get_tcp_ofo_queue(struct napi_struct *napi, struct sk_buff *skb) {
++	struct sk_buff_head_gro *ofo_queue, *ofo_queue_last = NULL;
++
++	ofo_queue = napi->out_of_order_queue_list;
++	while (ofo_queue) {
++		if (ofo_queue->hash == NAPI_GRO_CB(skb)->tcp_hash)
++			return ofo_queue;
++
++		ofo_queue_last = ofo_queue;
++		ofo_queue = ofo_queue->next_queue;
++	}
++
++	ofo_queue_last->age = 0;
++	ofo_queue_last->hash = 0;
++	ofo_queue_last->qlen = 0;
++	ofo_queue_last->skb_num = 0;
++	ofo_queue_last->seq_next = 0;
++
++	return ofo_queue_last;
++}
++
+ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+ {
+ 	struct sk_buff **pp = NULL;
+@@ -4002,6 +4161,9 @@
+ 	int same_flow;
+ 	enum gro_result ret;
+ 	int grow;
++	struct sk_buff_head_gro *ofo_queue;
++
++	NAPI_GRO_CB(skb)->out_of_order_queue = NULL;
+ 
+ 	if (!(skb->dev->features & NETIF_F_GRO))
+ 		goto normal;
+@@ -4022,6 +4184,7 @@
+ 		NAPI_GRO_CB(skb)->flush = 0;
+ 		NAPI_GRO_CB(skb)->free = 0;
+ 		NAPI_GRO_CB(skb)->udp_mark = 0;
++		NAPI_GRO_CB(skb)->is_tcp = false;
+ 
+ 		/* Setup for GRO checksum validation */
+ 		switch (skb->ip_summed) {
+@@ -4055,15 +4218,106 @@
+ 
+ 		*pp = nskb->next;
+ 		nskb->next = NULL;
+-		napi_gro_complete(nskb);
++		printk(KERN_NOTICE "dev_gro_receive qlen %u skb %u\n", NAPI_GRO_CB(nskb)->out_of_order_queue->qlen, NAPI_GRO_CB(nskb)->out_of_order_queue->skb_num);
++		dev_gro_complete(napi, nskb, 0);
+ 		napi->gro_count--;
+ 	}
+ 
+-	if (same_flow)
+-		goto ok;
++	if (same_flow) {
++		if (NAPI_GRO_CB(skb)->free)
++			goto ok;
++		else
++			goto pull;
++	}
++
++	if (NAPI_GRO_CB(skb)->flush) {
++		if (NAPI_GRO_CB(skb)->is_tcp && !NAPI_GRO_CB(skb)->out_of_order_queue) {
++			ofo_queue = napi_get_tcp_ofo_queue(napi, skb);
+ 
+-	if (NAPI_GRO_CB(skb)->flush)
++			//if (!ofo_queue) {
++			//	goto normal;
++			//}
++
++			NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++			if (ofo_queue->prev_queue) {
++				ofo_queue->prev_queue->next_queue = ofo_queue->next_queue;
++			} else {
++				napi->out_of_order_queue_list = ofo_queue->next_queue;
++			}	
++
++			if (ofo_queue->next_queue) {
++				ofo_queue->next_queue->prev_queue = ofo_queue->prev_queue;
++			}
++
++			if (!ofo_queue->age) {
++				ofo_queue->seq_next = NAPI_GRO_CB(skb)->seq;
++			}
++
++			ofo_queue->age = jiffies;
++			ofo_queue->hash = NAPI_GRO_CB(skb)->tcp_hash;
++			ofo_queue->prev_queue = NULL;
++			ofo_queue->next_queue = napi->out_of_order_queue_list;
++			if (napi->out_of_order_queue_list) {
++				napi->out_of_order_queue_list->prev_queue = ofo_queue;
++			}
++
++			napi->out_of_order_queue_list = ofo_queue;
++		}
+ 		goto normal;
++	}
++
++	NAPI_GRO_CB(skb)->count = 1;
++	NAPI_GRO_CB(skb)->age = jiffies;
++	NAPI_GRO_CB(skb)->timestamp = ktime_to_ns(ktime_get());
++	//NAPI_GRO_CB(skb)->last = skb;
++	if (NAPI_GRO_CB(skb)->is_tcp) {
++
++		ofo_queue = napi_get_tcp_ofo_queue(napi, skb);
++
++		//if (!ofo_queue) {
++		//	goto normal;
++		//}
++
++		NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++		if (ofo_queue->prev_queue) {
++			ofo_queue->prev_queue->next_queue = ofo_queue->next_queue;
++		} else {
++			napi->out_of_order_queue_list = ofo_queue->next_queue;
++		}
++
++		if (ofo_queue->next_queue) {
++			ofo_queue->next_queue->prev_queue = ofo_queue->prev_queue;
++		}
++
++		if (!ofo_queue->age) {
++			ofo_queue->seq_next = NAPI_GRO_CB(skb)->seq;
++		}
++
++		if (before(NAPI_GRO_CB(skb)->seq, ofo_queue->seq_next)) {
++			ofo_queue->age = jiffies;
++			ofo_queue->prev_queue = NULL;
++			ofo_queue->next_queue = napi->out_of_order_queue_list;
++			if (napi->out_of_order_queue_list) {
++				napi->out_of_order_queue_list->prev_queue = ofo_queue;
++			}
++			napi->out_of_order_queue_list = ofo_queue;
++			printk(KERN_NOTICE "flush point 10: %u %u\n", NAPI_GRO_CB(skb)->seq, ofo_queue->seq_next);
++			goto normal;
++		}
++
++		ofo_queue->next = skb;
++		ofo_queue->prev = skb;
++		ofo_queue->qlen = skb_gro_len(skb);
++		ofo_queue->skb_num = 1;
++		ofo_queue->hash = NAPI_GRO_CB(skb)->tcp_hash;
++	} else {
++		NAPI_GRO_CB(skb)->out_of_order_queue = NULL;
++	}
++	NAPI_GRO_CB(skb)->prev = NULL;
++	NAPI_GRO_CB(skb)->next = NULL;
++	skb_shinfo(skb)->gso_size = skb_gro_len(skb);
++	skb->next = napi->gro_list;
++	napi->gro_list = skb;
+ 
+ 	if (unlikely(napi->gro_count >= MAX_GRO_SKBS)) {
+ 		struct sk_buff *nskb = napi->gro_list;
+@@ -4075,16 +4329,11 @@
+ 		}
+ 		*pp = NULL;
+ 		nskb->next = NULL;
+-		napi_gro_complete(nskb);
++		dev_gro_complete(napi, nskb, 0);
+ 	} else {
+ 		napi->gro_count++;
+ 	}
+-	NAPI_GRO_CB(skb)->count = 1;
+-	NAPI_GRO_CB(skb)->age = jiffies;
+-	NAPI_GRO_CB(skb)->last = skb;
+-	skb_shinfo(skb)->gso_size = skb_gro_len(skb);
+-	skb->next = napi->gro_list;
+-	napi->gro_list = skb;
++
+ 	ret = GRO_HELD;
+ 
+ pull:
+@@ -4095,6 +4344,11 @@
+ 	return ret;
+ 
+ normal:
++	ofo_queue = NAPI_GRO_CB(skb)->out_of_order_queue;
++	if (ofo_queue) {
++		ofo_queue->seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(skb)->seq + NAPI_GRO_CB(skb)->len);
++	}
++	printk(KERN_NOTICE "normal qlen %u skb %u\n", NAPI_GRO_CB(skb)->len, 1);
+ 	ret = GRO_NORMAL;
+ 	goto pull;
+ }
+@@ -4178,6 +4432,7 @@
+ 	skb->skb_iif = 0;
+ 	skb->encapsulation = 0;
+ 	skb_shinfo(skb)->gso_type = 0;
++	skb_shinfo(skb)->gso_size = 0;
+ 	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
+ 
+ 	napi->skb = skb;
+@@ -4400,7 +4655,7 @@
+ void __napi_complete(struct napi_struct *n)
+ {
+ 	BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
+-	BUG_ON(n->gro_list);
++	//BUG_ON(n->gro_list);
+ 
+ 	list_del(&n->poll_list);
+ 	smp_mb__before_atomic();
+@@ -4478,12 +4733,91 @@
+ }
+ EXPORT_SYMBOL_GPL(napi_hash_del);
+ 
++static void napi_flush_watchdog_tasklet(unsigned long _napi) {
++
++	struct napi_struct *napi = (struct napi_struct*)_napi;
++	struct sk_buff *skb, *prev = NULL;
++
++	//printk(KERN_NOTICE "before lock 1\n");
++	if (!spin_trylock(&napi->gro_lock)) {
++		return;
++	}
++	//printk(KERN_NOTICE "after lock 1\n");
++	/*
++	for (skb = napi->gro_list; skb != NULL;skb = skb->next) {
++		skb->prev = prev;
++		prev = skb;
++	}
++
++	for (skb = prev; skb; skb = prev) {
++		prev = skb->prev;
++		skb->prev = NULL;
++		skb->next = NULL;
++		printk(KERN_NOTICE "napi_flush_watchdog qlen %u skb %u\n", NAPI_GRO_CB(skb)->out_of_order_queue->qlen, NAPI_GRO_CB(skb)->out_of_order_queue->skb_num);
++		dev_gro_complete(napi, skb, 0);
++	}
++
++	napi->gro_count = 0;
++	napi->gro_list = NULL;
++	*/
++	napi_gro_flush(napi, false);
++	printk(KERN_NOTICE "napi_flush_timer\n");
++
++	//printk(KERN_NOTICE "before unlock 1\n");
++	spin_unlock(&napi->gro_lock);
++	//printk(KERN_NOTICE "after unlock 1\n");
++
++	return;
++}
++
++static enum hrtimer_restart napi_flush_watchdog(struct hrtimer *timer)
++{
++	struct napi_struct *napi;
++
++	napi = container_of(timer, struct napi_struct, timer);
++
++	tasklet_hi_schedule(&napi->timer_timeout);
++
++	return HRTIMER_NORESTART;
++}
++
+ void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
+ 		    int (*poll)(struct napi_struct *, int), int weight)
+ {
++	int i;
++	struct sk_buff_head_gro *ofo_queue;
++
+ 	INIT_LIST_HEAD(&napi->poll_list);
++
++	hrtimer_init(&napi->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	napi->timer.function = napi_flush_watchdog;
++	tasklet_init(&napi->timer_timeout, napi_flush_watchdog_tasklet, (unsigned long)napi);
++	spin_lock_init(&napi->gro_lock);
++
+ 	napi->gro_count = 0;
+ 	napi->gro_list = NULL;
++	napi->out_of_order_queue_list = NULL;
++
++	for (i=0; i<=MAX_GRO_SKBS; i++) {
++		ofo_queue = (struct sk_buff_head_gro*)kmalloc(sizeof(struct sk_buff_head_gro), GFP_ATOMIC);
++
++		ofo_queue->next = NULL;
++		ofo_queue->prev = NULL;
++		ofo_queue->next_queue = napi->out_of_order_queue_list;
++		ofo_queue->prev_queue = NULL;
++		ofo_queue->age = 0;
++		ofo_queue->hash = 0;
++		ofo_queue->qlen = 0;
++		ofo_queue->skb_num = 0;
++		ofo_queue->seq_next = 0;
++
++		if (napi->out_of_order_queue_list) {
++			napi->out_of_order_queue_list->prev_queue = ofo_queue;
++		}
++
++		napi->out_of_order_queue_list = ofo_queue;
++	}
++
+ 	napi->skb = NULL;
+ 	napi->poll = poll;
+ 	if (weight > NAPI_POLL_WEIGHT)
+@@ -4502,10 +4836,45 @@
+ 
+ void netif_napi_del(struct napi_struct *napi)
+ {
++	struct sk_buff_head_gro *ofo_queue, *ofo_queue2;
++	struct sk_buff *skb, *skb2, *skb3, *skb4;
++
+ 	list_del_init(&napi->dev_list);
++
++	hrtimer_cancel(&napi->timer);
++
++	tasklet_kill(&napi->timer_timeout);
++
+ 	napi_free_frags(napi);
+ 
+-	kfree_skb_list(napi->gro_list);
++	//kfree_skb_list(napi->gro_list);
++
++	skb = napi->gro_list;
++	while (skb) {
++		skb2 = skb->next;
++		ofo_queue = NAPI_GRO_CB(skb)->out_of_order_queue;
++		if (ofo_queue) {
++			skb3 = ofo_queue->next;
++			while (skb3) {
++				skb4 = NAPI_GRO_CB(skb3)->next;
++				kfree_skb(skb3);
++				skb3 = skb4;
++			}
++			kfree(ofo_queue);
++		} else {
++			kfree(skb);
++		}
++		skb = skb2;
++	}
++
++	ofo_queue = napi->out_of_order_queue_list;
++	while (ofo_queue) {
++		ofo_queue2 = ofo_queue->next_queue;
++		kfree(ofo_queue);
++		ofo_queue = ofo_queue2;
++	}
++
++	napi->out_of_order_queue_list = NULL;
+ 	napi->gro_list = NULL;
+ 	napi->gro_count = 0;
+ }
+@@ -4517,6 +4886,7 @@
+ 	unsigned long time_limit = jiffies + 2;
+ 	int budget = netdev_budget;
+ 	void *have;
++	//unsigned long flags;
+ 
+ 	local_irq_disable();
+ 
+@@ -4540,8 +4910,15 @@
+ 		 */
+ 		n = list_first_entry(&sd->poll_list, struct napi_struct, poll_list);
+ 
++		//hrtimer_cancel(&n->timer);
++
+ 		have = netpoll_poll_lock(n);
+ 
++		//printk(KERN_NOTICE "before lock 2\n");
++		spin_lock(&n->gro_lock);
++		napi_clean_tcp_ofo_queue(n);
++		//printk(KERN_NOTICE "after lock 2\n");
++		//n->timestamp = ktime_get();
+ 		weight = n->weight;
+ 
+ 		/* This NAPI_STATE_SCHED test is for avoiding a race
+@@ -4560,6 +4937,10 @@
+ 
+ 		budget -= work;
+ 
++		//printk(KERN_NOTICE "before unlock 2\n");
++		//spin_unlock(&n->gro_lock);
++		//printk(KERN_NOTICE "after unlock 2\n");
++
+ 		local_irq_disable();
+ 
+ 		/* Drivers must not modify the NAPI state if they
+@@ -4570,7 +4951,17 @@
+ 		if (unlikely(work == weight)) {
+ 			if (unlikely(napi_disable_pending(n))) {
+ 				local_irq_enable();
++
++				//printk(KERN_NOTICE "before lock 3\n");
++				//spin_lock(&n->gro_lock);
++				//printk(KERN_NOTICE "after lock 3\n");
++
+ 				napi_complete(n);
++
++				//printk(KERN_NOTICE "before unlock 3\n");
++				//spin_unlock(&n->gro_lock);
++				//printk(KERN_NOTICE "after unlock 3\n");
++
+ 				local_irq_disable();
+ 			} else {
+ 				if (n->gro_list) {
+@@ -4578,13 +4969,24 @@
+ 					 * If HZ < 1000, flush all packets.
+ 					 */
+ 					local_irq_enable();
++
++					//printk(KERN_NOTICE "before lock 4\n");
++					//spin_lock(&n->gro_lock);
++					//printk(KERN_NOTICE "after lock 4\n");
++
+ 					napi_gro_flush(n, HZ >= 1000);
++
++					//printk(KERN_NOTICE "before unlock 4\n");
++					//spin_unlock(&n->gro_lock);
++					//printk(KERN_NOTICE "after unlock 4\n");
++
+ 					local_irq_disable();
+ 				}
+ 				list_move_tail(&n->poll_list, &sd->poll_list);
+ 			}
+ 		}
+ 
++		spin_unlock(&n->gro_lock);
+ 		netpoll_poll_unlock(have);
+ 	}
+ out:
+diff -Naur linux-3.18.5/net/core/skbuff.c linux-3.18.5-juggler/net/core/skbuff.c
+--- linux-3.18.5/net/core/skbuff.c	2015-01-30 09:41:03.000000000 +0800
++++ linux-3.18.5-juggler/net/core/skbuff.c	2016-09-09 05:45:11.957822358 +0800
+@@ -3096,22 +3096,64 @@
+ }
+ EXPORT_SYMBOL_GPL(skb_segment);
+ 
+-int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
++void skb_gro_flush(struct sk_buff_head_gro *ofo_queue, struct sk_buff *skb) {
++
++	struct sk_buff *p = ofo_queue->next, *p2;
++	unsigned qlen = 0, skb_num = 0;
++
++	if (skb == NULL) {
++		printk(KERN_ERR "skb_gro_flush second parameter cannot be NULL\n");
++		BUG_ON(skb == NULL);
++	}
++
++	while (p != NULL) {
++
++		p2 = NAPI_GRO_CB(p)->next;
++
++		qlen += NAPI_GRO_CB(p)->len;
++		skb_num++;
++
++		ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
++		ofo_queue->skb_num--;
++		ofo_queue->next = p2;
++		ofo_queue->seq_next = NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len;
++		
++		napi_gro_complete(p);
++		if (p != skb)
++			p = p2;
++		else {
++			if (p2) {
++				NAPI_GRO_CB(p2)->prev = NULL;
++			} else {
++				ofo_queue->prev = NULL;
++			}
++			break;
++		}
++	}
++
++
++
++	printk(KERN_NOTICE "skb_gro_flush qlen %u skb %u\n", qlen, skb_num);
++}
++
++void skb_gro_free(struct sk_buff *skb) {
++	if (NAPI_GRO_CB(skb)->free == NAPI_GRO_FREE_STOLEN_HEAD)
++		kmem_cache_free(skbuff_head_cache, skb);
++	else
++		__kfree_skb(skb);
++}
++
++int skb_gro_merge(struct sk_buff *p, struct sk_buff *skb)
+ {
+-	struct skb_shared_info *pinfo, *skbinfo = skb_shinfo(skb);
++	struct skb_shared_info *pinfo = skb_shinfo(p), *skbinfo = skb_shinfo(skb);
+ 	unsigned int offset = skb_gro_offset(skb);
+ 	unsigned int headlen = skb_headlen(skb);
+-	struct sk_buff *nskb, *lp, *p = *head;
+ 	unsigned int len = skb_gro_len(skb);
+ 	unsigned int delta_truesize;
+-	unsigned int headroom;
+ 
+ 	if (unlikely(p->len + len >= 65536))
+ 		return -E2BIG;
+ 
+-	lp = NAPI_GRO_CB(p)->last;
+-	pinfo = skb_shinfo(lp);
+-
+ 	if (headlen <= offset) {
+ 		skb_frag_t *frag;
+ 		skb_frag_t *frag2;
+@@ -3119,7 +3161,7 @@
+ 		int nr_frags = pinfo->nr_frags + i;
+ 
+ 		if (nr_frags > MAX_SKB_FRAGS)
+-			goto merge;
++			return -E2BIG;
+ 
+ 		offset -= headlen;
+ 		pinfo->nr_frags = nr_frags;
+@@ -3152,7 +3194,7 @@
+ 		unsigned int first_offset;
+ 
+ 		if (nr_frags + 1 + skbinfo->nr_frags > MAX_SKB_FRAGS)
+-			goto merge;
++			return -E2BIG;
+ 
+ 		first_offset = skb->data -
+ 			       (unsigned char *)page_address(page) +
+@@ -3171,85 +3213,173 @@
+ 		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE_STOLEN_HEAD;
+ 		goto done;
+ 	}
+-	/* switch back to head shinfo */
+-	pinfo = skb_shinfo(p);
+-
+-	if (pinfo->frag_list)
+-		goto merge;
+-	if (skb_gro_len(p) != pinfo->gso_size)
+-		return -E2BIG;
+-
+-	headroom = skb_headroom(p);
+-	nskb = alloc_skb(headroom + skb_gro_offset(p), GFP_ATOMIC);
+-	if (unlikely(!nskb))
+-		return -ENOMEM;
+-
+-	__copy_skb_header(nskb, p);
+-	nskb->mac_len = p->mac_len;
+-
+-	skb_reserve(nskb, headroom);
+-	__skb_put(nskb, skb_gro_offset(p));
+-
+-	skb_set_mac_header(nskb, skb_mac_header(p) - p->data);
+-	skb_set_network_header(nskb, skb_network_offset(p));
+-	skb_set_transport_header(nskb, skb_transport_offset(p));
+-
+-	__skb_pull(p, skb_gro_offset(p));
+-	memcpy(skb_mac_header(nskb), skb_mac_header(p),
+-	       p->data - skb_mac_header(p));
+-
+-	skb_shinfo(nskb)->frag_list = p;
+-	skb_shinfo(nskb)->gso_size = pinfo->gso_size;
+-	pinfo->gso_size = 0;
+-	__skb_header_release(p);
+-	NAPI_GRO_CB(nskb)->last = p;
+-
+-	nskb->data_len += p->len;
+-	nskb->truesize += p->truesize;
+-	nskb->len += p->len;
+-
+-	*head = nskb;
+-	nskb->next = p->next;
+-	p->next = NULL;
+-
+-	p = nskb;
+-
+-merge:
+-	delta_truesize = skb->truesize;
+-	if (offset > headlen) {
+-		unsigned int eat = offset - headlen;
+-
+-		skbinfo->frags[0].page_offset += eat;
+-		skb_frag_size_sub(&skbinfo->frags[0], eat);
+-		skb->data_len -= eat;
+-		skb->len -= eat;
+-		offset = headlen;
+-	}
+-
+-	__skb_pull(skb, offset);
+-
+-	if (NAPI_GRO_CB(p)->last == p)
+-		skb_shinfo(p)->frag_list = skb;
+-	else
+-		NAPI_GRO_CB(p)->last->next = skb;
+-	NAPI_GRO_CB(p)->last = skb;
+-	__skb_header_release(skb);
+-	lp = p;
++	
++	return -EINVAL;
+ 
+ done:
+-	NAPI_GRO_CB(p)->count++;
++	NAPI_GRO_CB(p)->count += NAPI_GRO_CB(skb)->count;
++	NAPI_GRO_CB(p)->len += NAPI_GRO_CB(skb)->len;
+ 	p->data_len += len;
+ 	p->truesize += delta_truesize;
+ 	p->len += len;
+-	if (lp != p) {
+-		lp->data_len += len;
+-		lp->truesize += delta_truesize;
+-		lp->len += len;
+-	}
+ 	NAPI_GRO_CB(skb)->same_flow = 1;
+ 	return 0;
+ }
+ 
++//int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
++//{
++//	struct skb_shared_info *pinfo, *skbinfo = skb_shinfo(skb);
++//	unsigned int offset = skb_gro_offset(skb);
++//	unsigned int headlen = skb_headlen(skb);
++//	struct sk_buff *nskb, *lp, *p = *head;
++//	unsigned int len = skb_gro_len(skb);
++//	unsigned int delta_truesize;
++//	unsigned int headroom;//
++
++//	if (unlikely(p->len + len >= 65536))
++//		return -E2BIG;//
++
++//	lp = NAPI_GRO_CB(p)->last;
++//	pinfo = skb_shinfo(lp);//
++
++//	if (headlen <= offset) {
++//		skb_frag_t *frag;
++//		skb_frag_t *frag2;
++//		int i = skbinfo->nr_frags;
++//		int nr_frags = pinfo->nr_frags + i;//
++
++//		if (nr_frags > MAX_SKB_FRAGS)
++//			goto merge;//
++
++//		offset -= headlen;
++//		pinfo->nr_frags = nr_frags;
++//		skbinfo->nr_frags = 0;//
++
++//		frag = pinfo->frags + nr_frags;
++//		frag2 = skbinfo->frags + i;
++//		do {
++//			*--frag = *--frag2;
++//		} while (--i);//
++
++//		frag->page_offset += offset;
++//		skb_frag_size_sub(frag, offset);//
++
++//		/* all fragments truesize : remove (head size + sk_buff) */
++//		delta_truesize = skb->truesize -
++//				 SKB_TRUESIZE(skb_end_offset(skb));//
++
++//		skb->truesize -= skb->data_len;
++//		skb->len -= skb->data_len;
++//		skb->data_len = 0;//
++
++//		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE;
++//		goto done;
++//	} else if (skb->head_frag) {
++//		int nr_frags = pinfo->nr_frags;
++//		skb_frag_t *frag = pinfo->frags + nr_frags;
++//		struct page *page = virt_to_head_page(skb->head);
++//		unsigned int first_size = headlen - offset;
++//		unsigned int first_offset;//
++
++//		if (nr_frags + 1 + skbinfo->nr_frags > MAX_SKB_FRAGS)
++//			goto merge;//
++
++//		first_offset = skb->data -
++//			       (unsigned char *)page_address(page) +
++//			       offset;//
++
++//		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;//
++
++//		frag->page.p	  = page;
++//		frag->page_offset = first_offset;
++//		skb_frag_size_set(frag, first_size);//
++
++//		memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
++//		/* We dont need to clear skbinfo->nr_frags here *///
++
++//		delta_truesize = skb->truesize - SKB_DATA_ALIGN(sizeof(struct sk_buff));
++//		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE_STOLEN_HEAD;
++//		goto done;
++//	}
++//	/* switch back to head shinfo */
++//	pinfo = skb_shinfo(p);//
++
++//	if (pinfo->frag_list)
++//		goto merge;
++//	if (skb_gro_len(p) != pinfo->gso_size)
++//		return -E2BIG;//
++
++//	headroom = skb_headroom(p);
++//	nskb = alloc_skb(headroom + skb_gro_offset(p), GFP_ATOMIC);
++//	if (unlikely(!nskb))
++//		return -ENOMEM;//
++
++//	__copy_skb_header(nskb, p);
++//	nskb->mac_len = p->mac_len;//
++
++//	skb_reserve(nskb, headroom);
++//	__skb_put(nskb, skb_gro_offset(p));//
++
++//	skb_set_mac_header(nskb, skb_mac_header(p) - p->data);
++//	skb_set_network_header(nskb, skb_network_offset(p));
++//	skb_set_transport_header(nskb, skb_transport_offset(p));//
++
++//	__skb_pull(p, skb_gro_offset(p));
++//	memcpy(skb_mac_header(nskb), skb_mac_header(p),
++//	       p->data - skb_mac_header(p));//
++
++//	skb_shinfo(nskb)->frag_list = p;
++//	skb_shinfo(nskb)->gso_size = pinfo->gso_size;
++//	pinfo->gso_size = 0;
++//	__skb_header_release(p);
++//	NAPI_GRO_CB(nskb)->last = p;//
++
++//	nskb->data_len += p->len;
++//	nskb->truesize += p->truesize;
++//	nskb->len += p->len;//
++
++//	*head = nskb;
++//	nskb->next = p->next;
++//	p->next = NULL;//
++
++//	p = nskb;//
++
++//merge:
++//	delta_truesize = skb->truesize;
++//	if (offset > headlen) {
++//		unsigned int eat = offset - headlen;//
++
++//		skbinfo->frags[0].page_offset += eat;
++//		skb_frag_size_sub(&skbinfo->frags[0], eat);
++//		skb->data_len -= eat;
++//		skb->len -= eat;
++//		offset = headlen;
++//	}//
++
++//	__skb_pull(skb, offset);//
++
++//	if (NAPI_GRO_CB(p)->last == p)
++//		skb_shinfo(p)->frag_list = skb;
++//	else
++//		NAPI_GRO_CB(p)->last->next = skb;
++//	NAPI_GRO_CB(p)->last = skb;
++//	__skb_header_release(skb);
++//	lp = p;//
++
++//done:
++//	NAPI_GRO_CB(p)->count++;
++//	p->data_len += len;
++//	p->truesize += delta_truesize;
++//	p->len += len;
++//	if (lp != p) {
++//		lp->data_len += len;
++//		lp->truesize += delta_truesize;
++//		lp->len += len;
++//	}
++//	NAPI_GRO_CB(skb)->same_flow = 1;
++//	return 0;
++//}
++
+ void __init skb_init(void)
+ {
+ 	skbuff_head_cache = kmem_cache_create("skbuff_head_cache",
+diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp_offload.c
+--- linux-3.18.5/net/ipv4/tcp_offload.c	2015-01-30 09:41:03.000000000 +0800
++++ linux-3.18.5-juggler/net/ipv4/tcp_offload.c	2016-09-09 05:45:11.957822358 +0800
+@@ -178,17 +178,33 @@
+ struct sk_buff **tcp_gro_receive(struct sk_buff **head, struct sk_buff *skb)
+ {
+ 	struct sk_buff **pp = NULL;
+-	struct sk_buff *p;
++	struct sk_buff *p, *p2, *p3, *p4, *p_next;
+ 	struct tcphdr *th;
+ 	struct tcphdr *th2;
+-	unsigned int len;
++	__u32 seq;
++	__u32 seq2;
++	__u32 len;
++	__u32 len2;
++	__u32 seq_next;
++	__u32 seq_next2;
++	__u32 in_seq;
++	__u32 in_seq_next;
+ 	unsigned int thlen;
+ 	__be32 flags;
+ 	unsigned int mss = 1;
+ 	unsigned int hlen;
+ 	unsigned int off;
++	int merged = 0;
+ 	int flush = 1;
+ 	int i;
++	struct sk_buff_head_gro *ofo_queue;
++	int err;
++
++	NAPI_GRO_CB(skb)->out_of_order_queue = NULL;
++	NAPI_GRO_CB(skb)->is_tcp = true;
++
++	//printk(KERN_NOTICE "tcp0\n");
++	//printk(KERN_NOTICE "%x\n", *head);
+ 
+ 	off = skb_gro_offset(skb);
+ 	hlen = off + sizeof(*th);
+@@ -198,10 +214,12 @@
+ 		if (unlikely(!th))
+ 			goto out;
+ 	}
++	//printk(KERN_NOTICE "tcp1\n");
+ 
+ 	thlen = th->doff * 4;
+ 	if (thlen < sizeof(*th))
+ 		goto out;
++	//printk(KERN_NOTICE "tcp2\n");
+ 
+ 	hlen = off + thlen;
+ 	if (skb_gro_header_hard(skb, hlen)) {
+@@ -209,17 +227,27 @@
+ 		if (unlikely(!th))
+ 			goto out;
+ 	}
++	//printk(KERN_NOTICE "tcp3\n");
+ 
+ 	skb_gro_pull(skb, thlen);
+ 
++	seq = ntohl(th->seq);
+ 	len = skb_gro_len(skb);
++	seq_next = seq + len;
+ 	flags = tcp_flag_word(th);
+ 
++	NAPI_GRO_CB(skb)->count = 1;
++	NAPI_GRO_CB(skb)->seq = seq;
++	NAPI_GRO_CB(skb)->len = len;
++	NAPI_GRO_CB(skb)->tcp_hash = *(__u32 *)&th->source;
++
+ 	for (; (p = *head); head = &p->next) {
+ 		if (!NAPI_GRO_CB(p)->same_flow)
+ 			continue;
+ 
+ 		th2 = tcp_hdr(p);
++		//printk(KERN_NOTICE "%x\n", *(u32 *)&th->source);
++		//printk(KERN_NOTICE "%x\n", *(u32 *)&th2->source);
+ 
+ 		if (*(u32 *)&th->source ^ *(u32 *)&th2->source) {
+ 			NAPI_GRO_CB(p)->same_flow = 0;
+@@ -228,45 +256,347 @@
+ 
+ 		goto found;
+ 	}
++	//printk(KERN_NOTICE "tcp4\n");
+ 
+ 	goto out_check_final;
+ 
+ found:
++	//printk(KERN_NOTICE "found0\n");
+ 	/* Include the IP ID check below from the inner most IP hdr */
+-	flush = NAPI_GRO_CB(p)->flush | NAPI_GRO_CB(p)->flush_id;
++	//printk(KERN_NOTICE "flush-1 %u\n", flush);
++	//printk(KERN_NOTICE "flush-2 %u\n", NAPI_GRO_CB(p)->flush);
++	//printk(KERN_NOTICE "flush-3 %u\n", NAPI_GRO_CB(p)->flush_id);
++	flush = NAPI_GRO_CB(p)->flush; //| NAPI_GRO_CB(p)->flush_id;
++	if (flush)
++	printk(KERN_NOTICE "flush0 %u\n", flush);
+ 	flush |= (__force int)(flags & TCP_FLAG_CWR);
++	if (flush)
++	printk(KERN_NOTICE "flush1 %u\n", flush);
+ 	flush |= (__force int)((flags ^ tcp_flag_word(th2)) &
+ 		  ~(TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH));
++	if (flush)
++	printk(KERN_NOTICE "flush2 %u\n", flush);
+ 	flush |= (__force int)(th->ack_seq ^ th2->ack_seq);
+-	for (i = sizeof(*th); i < thlen; i += 4)
+-		flush |= *(u32 *)((u8 *)th + i) ^
+-			 *(u32 *)((u8 *)th2 + i);
++	if (flush)
++	printk(KERN_NOTICE "flush3 %u\n", flush);
++	//for (i = sizeof(*th); i < thlen; i += 4)
++	//	flush |= *(u32 *)((u8 *)th + i) ^
++	//		 *(u32 *)((u8 *)th2 + i);
++	//if (flush)
++	//printk(KERN_NOTICE "flush4 %u\n", flush);
+ 
+ 	mss = tcp_skb_mss(p);
+ 
+ 	flush |= (len - 1) >= mss;
+-	flush |= (ntohl(th2->seq) + skb_gro_len(p)) ^ ntohl(th->seq);
++	if (flush)
++	printk(KERN_NOTICE "flush5 %u %u\n", len, mss);
++	/* allow out of order packets to be merged latter */
++	//flush |= (ntohl(th2->seq) + skb_gro_len(p)) ^ ntohl(th->seq);
+ 
++	/*
+ 	if (flush || skb_gro_receive(head, skb)) {
+ 		mss = 1;
+ 		goto out_check_final;
++	}*/
++
++	ofo_queue = NAPI_GRO_CB(p)->out_of_order_queue;
++	NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++	skb_shinfo(skb)->gso_size = mss;
++	//printk(KERN_NOTICE "%u\n", flush);
++	//printk(KERN_NOTICE "%u\n", ofo_queue->qlen);
++
++	if (flush) {
++		printk(KERN_NOTICE "flush point 1\n");
++		NAPI_GRO_CB(skb)->flush = 1;
++		return head;
++	}
++	//printk(KERN_NOTICE "found1\n");
++
++	if (before(NAPI_GRO_CB(skb)->seq, ofo_queue->seq_next)) {
++		printk(KERN_NOTICE "flush point 2\n");
++		NAPI_GRO_CB(skb)->flush = 1;
++		return NULL;
+ 	}
+ 
+-	p = *head;
+-	th2 = tcp_hdr(p);
+-	tcp_flag_word(th2) |= flags & (TCP_FLAG_FIN | TCP_FLAG_PSH);
++	// need to make sure the one in gro_list is always the head of the ofo_queue
++	//printk(KERN_NOTICE "enqueue\n");
++	NAPI_GRO_CB(skb)->age = jiffies;
++	NAPI_GRO_CB(skb)->timestamp = ktime_to_ns(ktime_get());
++	p2 = NAPI_GRO_CB(p)->out_of_order_queue->next;
++	p_next = p->next;
++	in_seq_next = ofo_queue->seq_next;
++	while (p2) {
++		seq2 = NAPI_GRO_CB(p2)->seq;
++		len2 = NAPI_GRO_CB(p2)->len;
++		seq_next2 = seq2 + len2;
++
++		in_seq = in_seq_next;
++		if (in_seq == seq2) {
++			in_seq_next = seq_next2;
++		}
++		//printk(KERN_NOTICE "seq %u\n", seq);
++		//printk(KERN_NOTICE "seq_next %u\n", seq_next);
++		//printk(KERN_NOTICE "seq2 %u\n", seq2);
++		//printk(KERN_NOTICE "seq_next2 %u\n", seq_next2);
++
++
++		if (before(seq_next, seq2)) {
++			//printk(KERN_NOTICE "enqueue0\n");
++			NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++			NAPI_GRO_CB(skb)->prev = NAPI_GRO_CB(p2)->prev;
++			NAPI_GRO_CB(skb)->next = p2;
++			ofo_queue->qlen += len;
++			ofo_queue->skb_num++;
++			if (NAPI_GRO_CB(p2)->prev == NULL) {
++				ofo_queue->next = skb;
++				NAPI_GRO_CB(p2)->prev = skb;
++
++				*head = skb;
++				skb->next = p_next;
++			} else {
++				NAPI_GRO_CB(NAPI_GRO_CB(p2)->prev)->next = skb;
++				NAPI_GRO_CB(p2)->prev = skb;
++			}
++
++			merged = 1;
++			NAPI_GRO_CB(skb)->same_flow = 1;
++			break;
++
++		} else if (seq_next == seq2) {
++			//printk(KERN_NOTICE "enqueue1\n");
++
++			if ((err = skb_gro_merge(skb, p2))) {
++
++				if (err == -E2BIG && in_seq != seq) {
++					NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++					NAPI_GRO_CB(skb)->prev = NAPI_GRO_CB(p2)->prev;
++					NAPI_GRO_CB(skb)->next = p2;
++					ofo_queue->qlen += len;
++					ofo_queue->skb_num++;
++					if (NAPI_GRO_CB(p2)->prev == NULL) {
++						ofo_queue->next = skb;
++						NAPI_GRO_CB(p2)->prev = skb;
++
++						*head = skb;
++						skb->next = p_next;
++					} else {
++						NAPI_GRO_CB(NAPI_GRO_CB(p2)->prev)->next = skb;
++						NAPI_GRO_CB(p2)->prev = skb;
++					}
++
++					merged = 1;
++					NAPI_GRO_CB(skb)->same_flow = 1;
++					break;
++
++				} else {
++					printk(KERN_NOTICE "flush point 3\n");
++					p3 = NAPI_GRO_CB(p2)->next;
++					if (p3 != NULL) {
++						*head = p3;
++						p3->next = p_next;
++						skb_gro_flush(ofo_queue, p2);
++						NAPI_GRO_CB(skb)->flush = 1;
++						return NULL;
++					} else {
++						NAPI_GRO_CB(skb)->flush = 1;
++						return head;
++					}
++				}
++			}
++
++			NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++			NAPI_GRO_CB(skb)->prev = NAPI_GRO_CB(p2)->prev;
++			NAPI_GRO_CB(skb)->next = NAPI_GRO_CB(p2)->next;
++			NAPI_GRO_CB(skb)->age = NAPI_GRO_CB(p2)->age;
++			NAPI_GRO_CB(skb)->timestamp = NAPI_GRO_CB(p2)->timestamp;
++			ofo_queue->qlen += len;
++
++			if (NAPI_GRO_CB(p2)->prev == NULL) {
++				ofo_queue->next = skb;
++
++				*head = skb;
++				skb->next = p_next;
++			} else {
++				NAPI_GRO_CB(NAPI_GRO_CB(p2)->prev)->next = skb;
++			}
++
++			if (NAPI_GRO_CB(p2)->next == NULL) {
++				ofo_queue->prev = skb;
++			} else {
++				NAPI_GRO_CB(NAPI_GRO_CB(p2)->next)->prev = skb;
++			}
++
++			skb_gro_free(p2);
++
++			merged = 1;
++			NAPI_GRO_CB(skb)->same_flow = 1;
++			break;
++
++		} else if (seq == seq_next2) {
++			//printk(KERN_NOTICE "enqueue2\n");
++
++			if ((err = skb_gro_merge(p2, skb))) {
++
++				if (err == -E2BIG) {
++					p3 = NAPI_GRO_CB(p2)->next;
++					if (p3 != NULL) {
++						if (in_seq == seq2) {
++							printk(KERN_NOTICE "flush point 40\n");
++							*head = p3;
++							p3->next = p_next;
++							skb_gro_flush(ofo_queue, p2);
++						}
++						p2 = p3;
++						continue;
++					} else {
++						NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++						NAPI_GRO_CB(skb)->prev = p2;
++						NAPI_GRO_CB(skb)->next = NULL;
++
++						ofo_queue->qlen += len;
++						ofo_queue->skb_num++;
++
++						NAPI_GRO_CB(p2)->next = skb;
++						ofo_queue->prev = skb;
++						
++						merged = 1;
++						NAPI_GRO_CB(skb)->same_flow = 1;
++
++						if (in_seq == seq2) {
++							printk(KERN_NOTICE "flush point 41\n");
++							*head = skb;
++							skb->next = p_next;
++							skb_gro_flush(ofo_queue, p2);
++						}
++
++						break;
++					}
++				} else {
++					printk(KERN_NOTICE "flush point 4\n");
++					p3 = NAPI_GRO_CB(p2)->next;
++					if (p3 != NULL) {
++						*head = p3;
++						p3->next = p_next;
++						skb_gro_flush(ofo_queue, p2);
++						NAPI_GRO_CB(skb)->flush = 1;
++						return NULL;
++					} else {
++						NAPI_GRO_CB(skb)->flush = 1;
++						return head;
++					}
++				}
++			}
++
++			th2 = tcp_hdr(p2);
++			tcp_flag_word(th2) |= flags & (TCP_FLAG_FIN | TCP_FLAG_PSH);
++
++			//skb_gro_free(skb);
++
++			ofo_queue->qlen += len;
++
++			p3 = NAPI_GRO_CB(p2)->next;
++			if (p3 != NULL) {
++
++				if (seq_next == NAPI_GRO_CB(p3)->seq) {
++
++					//printk(KERN_NOTICE "merge p3\n");
++					if ((err = skb_gro_merge(p2, p3))) {
++						if (err == -E2BIG) {
++							if (in_seq == seq2) {
++								printk(KERN_NOTICE "flush point 50\n");
++								*head = p3;
++								p3->next = p_next;
++								skb_gro_flush(ofo_queue, p2);
++							}
++							return NULL;
++						} else {
++							//printk(KERN_NOTICE "merge fail\n");
++							printk(KERN_NOTICE "flush point 5\n");
++							p4 = NAPI_GRO_CB(p3)->next;
++							if (p4 != NULL) {
++								*head = p4;
++								p4->next = p_next;
++								skb_gro_flush(ofo_queue, p3);
++								return NULL;
++							} else {
++								return head;
++							}
++						}
++					}
++
++					ofo_queue->skb_num--;	
++
++					NAPI_GRO_CB(p2)->next = NAPI_GRO_CB(p3)->next;
++					NAPI_GRO_CB(p2)->age = min(NAPI_GRO_CB(p2)->age, NAPI_GRO_CB(p3)->age);
++					NAPI_GRO_CB(p2)->timestamp = min(NAPI_GRO_CB(p2)->timestamp, NAPI_GRO_CB(p3)->timestamp);
++					
++					skb_gro_free(p3);	
++
++					if (NAPI_GRO_CB(p2)->next == NULL) {
++						ofo_queue->prev = p2;
++					} else {
++						NAPI_GRO_CB(NAPI_GRO_CB(p2)->next)->prev = p2;
++					}
++
++				} else if (after(seq_next, NAPI_GRO_CB(p3)->seq)) {
++					printk(KERN_NOTICE "flush point 7\n");
++					return head;
++				}
++
++			}
++
++			merged = 1;
++			break;
++
++		} else if (after(seq, seq_next2)) {
++			//printk(KERN_NOTICE "enqueue3\n");
++
++			if (NAPI_GRO_CB(p2)->next == NULL) {
++
++				NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++				NAPI_GRO_CB(skb)->prev = p2;
++				NAPI_GRO_CB(skb)->next = NULL;
++
++				ofo_queue->qlen += len;
++				ofo_queue->skb_num++;
++				ofo_queue->prev = skb;
++				NAPI_GRO_CB(p2)->next = skb;
++
++				merged = 1;
++				NAPI_GRO_CB(skb)->same_flow = 1;
++				break;
++
++			} else {
++				p2 = NAPI_GRO_CB(p2)->next;
++				continue;
++			}
++
++		} else {
++			//printk(KERN_NOTICE "enqueue4\n");
++			printk(KERN_NOTICE "flush point 8\n");
++			NAPI_GRO_CB(skb)->flush = 1;
++			return head;
++		}
++	}
+ 
+ out_check_final:
++	//printk(KERN_NOTICE "%u\n", len);
++	//printk(KERN_NOTICE "%u\n", mss);
+ 	flush = len < mss;
+-	flush |= (__force int)(flags & (TCP_FLAG_URG | TCP_FLAG_PSH |
+-					TCP_FLAG_RST | TCP_FLAG_SYN |
+-					TCP_FLAG_FIN));
++	//flush |= (__force int)(flags & (TCP_FLAG_URG | TCP_FLAG_PSH |
++	//				TCP_FLAG_RST | TCP_FLAG_SYN |
++	//				TCP_FLAG_FIN));
+ 
+-	if (p && (!NAPI_GRO_CB(skb)->same_flow || flush))
++	if (p && (!merged || flush)) {
++		printk(KERN_NOTICE "flush point 9\n");
+ 		pp = head;
++	}
+ 
+ out:
++	//printk(KERN_NOTICE "%x\n", NAPI_GRO_CB(skb)->flush);
+ 	NAPI_GRO_CB(skb)->flush |= (flush != 0);
++	//printk(KERN_NOTICE "%x\n", NAPI_GRO_CB(skb)->flush);
++	//printk(KERN_NOTICE "%x\n", pp);
+ 
+ 	return pp;
+ }
