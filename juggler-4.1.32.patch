@@ -1,47 +1,120 @@
-diff -Naur linux-3.18.5/include/linux/netdevice.h linux-3.18.5-juggler/include/linux/netdevice.h
---- linux-3.18.5/include/linux/netdevice.h	2015-01-30 09:41:03.000000000 +0800
-+++ linux-3.18.5-juggler/include/linux/netdevice.h	2016-09-09 05:45:00.541822353 +0800
-@@ -313,7 +313,12 @@
- #endif
- 	struct net_device	*dev;
- 	struct sk_buff		*gro_list;
-+	struct sk_buff_head_gro	*out_of_order_queue_list;
- 	struct sk_buff		*skb;
-+	//struct ktime_t		timestamp;
-+	struct hrtimer		timer;
-+	struct tasklet_struct	timer_timeout;
-+	spinlock_t 			gro_lock;
+diff -Naur linux-4.1.32/drivers/net/ethernet/altera/altera_tse_main.c linux-4.1.32-juggler/drivers/net/ethernet/altera/altera_tse_main.c
+--- linux-4.1.32/drivers/net/ethernet/altera/altera_tse_main.c	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/drivers/net/ethernet/altera/altera_tse_main.c	2016-09-09 06:11:44.725823130 +0800
+@@ -511,7 +511,8 @@
+ 
+ 	if (rxcomplete < budget) {
+ 
+-		napi_complete(napi);
++		napi_gro_flush(napi, false);
++		__napi_complete(napi);
+ 
+ 		netdev_dbg(priv->dev,
+ 			   "NAPI Complete, did %d packets with budget %d\n",
+diff -Naur linux-4.1.32/drivers/net/ethernet/brocade/bna/bnad.c linux-4.1.32-juggler/drivers/net/ethernet/brocade/bna/bnad.c
+--- linux-4.1.32/drivers/net/ethernet/brocade/bna/bnad.c	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/drivers/net/ethernet/brocade/bna/bnad.c	2016-09-09 06:11:44.729823130 +0800
+@@ -675,7 +675,6 @@
+ 			if (!next_cmpl->valid)
+ 				break;
+ 		}
+-		packets++;
+ 
+ 		/* TODO: BNA_CQ_EF_LOCAL ? */
+ 		if (unlikely(flags & (BNA_CQ_EF_MAC_ERROR |
+@@ -692,6 +691,7 @@
+ 		else
+ 			bnad_cq_setup_skb_frags(rcb, skb, sop_ci, nvecs, len);
+ 
++		packets++;
+ 		rcb->rxq->rx_packets++;
+ 		rcb->rxq->rx_bytes += totlen;
+ 		ccb->bytes_per_intr += totlen;
+diff -Naur linux-4.1.32/include/linux/netdevice.h linux-4.1.32-juggler/include/linux/netdevice.h
+--- linux-4.1.32/include/linux/netdevice.h	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/include/linux/netdevice.h	2016-09-09 06:11:59.453823138 +0800
+@@ -265,7 +265,6 @@
+ 	void	(*cache_update)(struct hh_cache *hh,
+ 				const struct net_device *dev,
+ 				const unsigned char *haddr);
+-	bool	(*validate)(const char *ll_header, unsigned int len);
+ };
+ 
+ /* These flag bits are private to the generic network queueing
+@@ -321,6 +320,9 @@
  	struct list_head	dev_list;
  	struct hlist_node	napi_hash_node;
  	unsigned int		napi_id;
-@@ -1910,7 +1915,25 @@
++
++	struct sk_buff_head_gro *out_of_order_queue_list;
++	struct sk_buff_head_gro *out_of_order_queue_last;
+ };
+ 
+ enum {
+@@ -1373,7 +1375,7 @@
+  *	@dma:		DMA channel
+  *	@mtu:		Interface MTU value
+  *	@type:		Interface hardware type
+- *	@hard_header_len: Maximum hardware header length.
++ *	@hard_header_len: Hardware header length
+  *
+  *	@needed_headroom: Extra headroom the hardware may need, but not in all
+  *			  cases can this be guaranteed
+@@ -1650,6 +1652,8 @@
+ #endif
+ 
+ 	unsigned long		gro_flush_timeout;
++	unsigned long		gro_inseq_timeout;
++	unsigned long		gro_ofo_timeout;
+ 	rx_handler_func_t __rcu	*rx_handler;
+ 	void __rcu		*rx_handler_data;
+ 
+@@ -1932,7 +1936,7 @@
+ 	u16	gro_remcsum_start;
+ 
+ 	/* jiffies when first packet was created/queued */
+-	unsigned long age;
++	//unsigned long age;
+ 
+ 	/* Used in ipv6_gro_receive() and foo-over-udp */
+ 	u16	proto;
+@@ -1956,14 +1960,32 @@
+ 
+ 	/* Used in foo-over-udp, set in udp[46]_gro_receive */
+ 	u8	is_ipv6:1;
+-
+-	/* 7 bit hole */
++	u8	gso_end:1;
++	/* 6 bit hole */
+ 
+ 	/* used to support CHECKSUM_COMPLETE for tunneling protocols */
  	__wsum	csum;
  
  	/* used in skb_gro_receive() slow path */
 -	struct sk_buff *last;
 +	//struct sk_buff *last;
 +
-+	/* out of order queue for tcp */
-+	struct sk_buff_head_gro *out_of_order_queue;
++        /* out of order queue for tcp */
++        struct sk_buff_head_gro *out_of_order_queue;
 +
-+	/* the prev/next skb in the out of order queue */
-+	struct sk_buff *prev;
-+	struct sk_buff *next;
++        /* the prev/next skb in the out of order queue */
++        struct sk_buff *prev;
++        struct sk_buff *next;
 +
-+	/* seq and len of tcp data*/
-+	__u32 seq;
-+	__u32 len;
++        /* seq and len of tcp data*/
++        __u32 seq;
++        __u32 len;
 +
-+	/* if this skb is a TCP packet */
-+	bool is_tcp;
-+	__u32 tcp_hash;
++        /* if this skb is a TCP packet */
++        bool is_tcp;
++        __u32 tcp_hash;
 +
-+	/* similar to age, for tcp reordering only */
-+	u64 timestamp;
++        /* similar to age, for tcp reordering only */
++        //u64 timestamp;
  };
  
  #define NAPI_GRO_CB(skb) ((struct napi_gro_cb *)(skb)->cb)
-@@ -2127,7 +2150,13 @@
+@@ -2204,7 +2226,13 @@
  struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
  int netdev_get_name(struct net *net, char *name, int ifindex);
  int dev_restart(struct net_device *dev);
@@ -56,39 +129,87 @@ diff -Naur linux-3.18.5/include/linux/netdevice.h linux-3.18.5-juggler/include/l
  
  static inline unsigned int skb_gro_offset(const struct sk_buff *skb)
  {
-@@ -2834,6 +2863,7 @@
+@@ -2417,24 +2445,6 @@
+ 	return dev->header_ops->parse(skb, haddr);
+ }
+ 
+-/* ll_header must have at least hard_header_len allocated */
+-static inline bool dev_validate_header(const struct net_device *dev,
+-				       char *ll_header, int len)
+-{
+-	if (likely(len >= dev->hard_header_len))
+-		return true;
+-
+-	if (capable(CAP_SYS_RAWIO)) {
+-		memset(ll_header + len, 0, dev->hard_header_len - len);
+-		return true;
+-	}
+-
+-	if (dev->header_ops && dev->header_ops->validate)
+-		return dev->header_ops->validate(ll_header, len);
+-
+-	return false;
+-}
+-
+ typedef int gifconf_func_t(struct net_device * dev, char __user * bufptr, int len);
+ int register_gifconf(unsigned int family, gifconf_func_t *gifconf);
+ static inline int unregister_gifconf(unsigned int family)
+@@ -2957,6 +2967,7 @@
  int netif_rx(struct sk_buff *skb);
  int netif_rx_ni(struct sk_buff *skb);
- int netif_receive_skb(struct sk_buff *skb);
+ int netif_receive_skb_sk(struct sock *sk, struct sk_buff *skb);
 +int netif_receive_skb_internal(struct sk_buff *skb);
- gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
- void napi_gro_flush(struct napi_struct *napi, bool flush_old);
- struct sk_buff *napi_get_frags(struct napi_struct *napi);
-diff -Naur linux-3.18.5/include/linux/skbuff.h linux-3.18.5-juggler/include/linux/skbuff.h
---- linux-3.18.5/include/linux/skbuff.h	2015-01-30 09:41:03.000000000 +0800
-+++ linux-3.18.5-juggler/include/linux/skbuff.h	2016-09-09 05:45:00.541822353 +0800
-@@ -174,6 +174,20 @@
+ static inline int netif_receive_skb(struct sk_buff *skb)
+ {
+ 	return netif_receive_skb_sk(skb->sk, skb);
+diff -Naur linux-4.1.32/include/linux/skbuff.h linux-4.1.32-juggler/include/linux/skbuff.h
+--- linux-4.1.32/include/linux/skbuff.h	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/include/linux/skbuff.h	2016-09-09 06:11:59.453823138 +0800
+@@ -189,6 +189,28 @@
  	spinlock_t	lock;
  };
  
-+struct sk_buff_head_gro {
-+	/* These two members must be first. */
-+	struct sk_buff				*next;
-+	struct sk_buff				*prev;
-+	struct sk_buff_head_gro		*next_queue;
-+	struct sk_buff_head_gro		*prev_queue;
++enum {
++	SKB_MERGE_2BIG = 1,
++	SKB_MERGE_INVAL = 2,
++	SKB_MERGE_FAIL = 3,
++};
 +
-+	unsigned long 				age;
-+	__u32						hash;
-+	__u32						qlen;
-+	__u32						skb_num;
-+	__u32						seq_next;
++struct sk_buff_head_gro {
++        /* These two members must be first. */
++        struct sk_buff                          *next;
++        struct sk_buff                          *prev;
++        struct sk_buff_head_gro         *next_queue;
++        struct sk_buff_head_gro         *prev_queue;
++
++        u64                                             timestamp;
++        u64                                             ofo_timeout;
++        __u32                                           hash;
++        __u32                                           qlen;
++        __u32                                           skb_num;
++        __u32                                           seq_next;
++	bool						flushed;
 +};
 +
  struct sk_buff;
  
  /* To allow 64K frame to be packed as single skb without frag_list we
-@@ -522,7 +536,7 @@
+@@ -198,12 +220,11 @@
+  * Since GRO uses frags we allocate at least 16 regardless of page
+  * size.
+  */
+-#if (65536/PAGE_SIZE + 1) < 16
+-#define MAX_SKB_FRAGS 16UL
++#if (65536/PAGE_SIZE + 1) < 45
++#define MAX_SKB_FRAGS 45UL
+ #else
+ #define MAX_SKB_FRAGS (65536/PAGE_SIZE + 1)
+ #endif
+-extern int sysctl_max_skb_frags;
+ 
+ typedef struct skb_frag_struct skb_frag_t;
+ 
+@@ -540,7 +561,7 @@
  	 * want to keep them across layers you have to do a skb_clone()
  	 * first. This is owned by whoever has the skb queued ATM.
  	 */
@@ -97,35 +218,844 @@ diff -Naur linux-3.18.5/include/linux/skbuff.h linux-3.18.5-juggler/include/linu
  
  	unsigned long		_skb_refdst;
  	void			(*destructor)(struct sk_buff *skb);
-diff -Naur linux-3.18.5/net/core/dev.c linux-3.18.5-juggler/net/core/dev.c
---- linux-3.18.5/net/core/dev.c	2015-01-30 09:41:03.000000000 +0800
-+++ linux-3.18.5-juggler/net/core/dev.c	2016-09-09 05:45:11.957822358 +0800
-@@ -102,6 +102,7 @@
- #include <net/pkt_sched.h>
- #include <net/checksum.h>
- #include <net/xfrm.h>
+@@ -1591,16 +1612,20 @@
+ 	skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+ 
+ 	/*
+-	 * Propagate page pfmemalloc to the skb if we can. The problem is
+-	 * that not all callers have unique ownership of the page but rely
+-	 * on page_is_pfmemalloc doing the right thing(tm).
++	 * Propagate page->pfmemalloc to the skb if we can. The problem is
++	 * that not all callers have unique ownership of the page. If
++	 * pfmemalloc is set, we check the mapping as a mapping implies
++	 * page->index is set (index and pfmemalloc share space).
++	 * If it's a valid mapping, we cannot use page->pfmemalloc but we
++	 * do not lose pfmemalloc information as the pages would not be
++	 * allocated using __GFP_MEMALLOC.
+ 	 */
+ 	frag->page.p		  = page;
+ 	frag->page_offset	  = off;
+ 	skb_frag_size_set(frag, size);
+ 
+ 	page = compound_head(page);
+-	if (page_is_pfmemalloc(page))
++	if (page->pfmemalloc && !page->mapping)
+ 		skb->pfmemalloc	= true;
+ }
+ 
+@@ -1781,30 +1806,6 @@
+ 	skb->tail += len;
+ }
+ 
+-/**
+- *	skb_tailroom_reserve - adjust reserved_tailroom
+- *	@skb: buffer to alter
+- *	@mtu: maximum amount of headlen permitted
+- *	@needed_tailroom: minimum amount of reserved_tailroom
+- *
+- *	Set reserved_tailroom so that headlen can be as large as possible but
+- *	not larger than mtu and tailroom cannot be smaller than
+- *	needed_tailroom.
+- *	The required headroom should already have been reserved before using
+- *	this function.
+- */
+-static inline void skb_tailroom_reserve(struct sk_buff *skb, unsigned int mtu,
+-					unsigned int needed_tailroom)
+-{
+-	SKB_LINEAR_ASSERT(skb);
+-	if (mtu < skb_tailroom(skb) - needed_tailroom)
+-		/* use at most mtu */
+-		skb->reserved_tailroom = skb_tailroom(skb) - mtu;
+-	else
+-		/* use up to all available space */
+-		skb->reserved_tailroom = needed_tailroom;
+-}
+-
+ #define ENCAP_TYPE_ETHER	0
+ #define ENCAP_TYPE_IPPROTO	1
+ 
+@@ -2271,7 +2272,7 @@
+ static inline void skb_propagate_pfmemalloc(struct page *page,
+ 					     struct sk_buff *skb)
+ {
+-	if (page_is_pfmemalloc(page))
++	if (page && page->pfmemalloc)
+ 		skb->pfmemalloc = true;
+ }
+ 
+@@ -2613,9 +2614,6 @@
+ {
+ 	if (skb->ip_summed == CHECKSUM_COMPLETE)
+ 		skb->csum = csum_sub(skb->csum, csum_partial(start, len, 0));
+-	else if (skb->ip_summed == CHECKSUM_PARTIAL &&
+-		 skb_checksum_start_offset(skb) < 0)
+-		skb->ip_summed = CHECKSUM_NONE;
+ }
+ 
+ unsigned char *skb_pull_rcsum(struct sk_buff *skb, unsigned int len);
+@@ -3345,8 +3343,7 @@
+ 	int	encap_level;
+ 	__u16	csum_start;
+ };
+-#define SKB_SGO_CB_OFFSET	32
+-#define SKB_GSO_CB(skb) ((struct skb_gso_cb *)((skb)->cb + SKB_SGO_CB_OFFSET))
++#define SKB_GSO_CB(skb) ((struct skb_gso_cb *)(skb)->cb)
+ 
+ static inline int skb_tnl_header_len(const struct sk_buff *inner_skb)
+ {
+diff -Naur linux-4.1.32/net/core/dev.c linux-4.1.32-juggler/net/core/dev.c
+--- linux-4.1.32/net/core/dev.c	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/net/core/dev.c	2016-09-09 06:12:15.549823145 +0800
+@@ -17,13 +17,13 @@
+  *		David Hinds <dahinds@users.sourceforge.net>
+  *		Alexey Kuznetsov <kuznet@ms2.inr.ac.ru>
+  *		Adam Sulmicki <adam@cfar.umd.edu>
+- *              Pekka Riikonen <priikone@poesidon.pspt.fi>
++ *			  Pekka Riikonen <priikone@poesidon.pspt.fi>
+  *
+  *	Changes:
+- *              D.J. Barrow     :       Fixed bug where dev->refcnt gets set
+- *              			to 2 if register_netdev gets called
+- *              			before net_dev_init & also removed a
+- *              			few lines of code in the process.
++ *			  D.J. Barrow	 :	   Fixed bug where dev->refcnt gets set
++ *			  			to 2 if register_netdev gets called
++ *			  			before net_dev_init & also removed a
++ *			  			few lines of code in the process.
+  *		Alan Cox	:	device private ioctl copies fields back.
+  *		Alan Cox	:	Transmit queue code does relevant
+  *					stunts to keep the queue safe.
+@@ -56,20 +56,20 @@
+  *		Alan Cox	:	Cleaned up the backlog initialise.
+  *		Craig Metz	:	SIOCGIFCONF fix if space for under
+  *					1 device.
+- *	    Thomas Bogendoerfer :	Return ENODEV for dev_open, if there
++ *		Thomas Bogendoerfer :	Return ENODEV for dev_open, if there
+  *					is no device open function.
+  *		Andi Kleen	:	Fix error reporting for SIOCGIFCONF
+- *	    Michael Chastain	:	Fix signed/unsigned for SIOCGIFCONF
++ *		Michael Chastain	:	Fix signed/unsigned for SIOCGIFCONF
+  *		Cyrus Durgin	:	Cleaned for KMOD
+  *		Adam Sulmicki   :	Bug Fix : Network Device Unload
+  *					A network device unload needs to purge
+  *					the backlog queue.
+  *	Paul Rusty Russell	:	SIOCSIFNAME
+- *              Pekka Riikonen  :	Netdev boot-time settings code
+- *              Andrew Morton   :       Make unregister_netdevice wait
+- *              			indefinitely on dev->refcnt
++ *			  Pekka Riikonen  :	Netdev boot-time settings code
++ *			  Andrew Morton   :	   Make unregister_netdevice wait
++ *			  			indefinitely on dev->refcnt
+  * 		J Hadi Salim	:	- Backlog queue sampling
+- *				        - netif_rx() feedback
++ *						- netif_rx() feedback
+  */
+ 
+ #include <asm/uaccess.h>
+@@ -118,6 +118,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/ip.h>
+ #include <net/ip.h>
 +#include <net/tcp.h>
- #include <linux/highmem.h>
- #include <linux/init.h>
- #include <linux/module.h>
-@@ -3785,7 +3786,7 @@
+ #include <net/mpls.h>
+ #include <linux/ipv6.h>
+ #include <linux/in.h>
+@@ -409,7 +410,7 @@
+  *	from the kernel lists and can be freed or reused once this function
+  *	returns.
+  *
+- *      The packet type might still be in use by receivers
++ *	  The packet type might still be in use by receivers
+  *	and must not be freed until after all the CPU's have gone
+  *	through a quiescent state.
+  */
+@@ -485,7 +486,7 @@
+  *	is removed from the kernel lists and can be freed or reused once this
+  *	function returns.
+  *
+- *      The packet type might still be in use by receivers
++ *	  The packet type might still be in use by receivers
+  *	and must not be freed until after all the CPU's have gone
+  *	through a quiescent state.
+  */
+@@ -530,7 +531,7 @@
+ 
+ /******************************************************************************
+ 
+-		      Device Boot-time Settings Routines
++			  Device Boot-time Settings Routines
+ 
+ *******************************************************************************/
+ 
+@@ -580,7 +581,7 @@
+ 
+ 	for (i = 0; i < NETDEV_BOOT_SETUP_MAX; i++) {
+ 		if (s[i].name[0] != '\0' && s[i].name[0] != ' ' &&
+-		    !strcmp(dev->name, s[i].name)) {
++			!strcmp(dev->name, s[i].name)) {
+ 			dev->irq 	= s[i].map.irq;
+ 			dev->base_addr 	= s[i].map.base_addr;
+ 			dev->mem_start 	= s[i].map.mem_start;
+@@ -655,7 +656,7 @@
+ 
+ /*******************************************************************************
+ 
+-			    Device Interface Subroutines
++				Device Interface Subroutines
+ 
+ *******************************************************************************/
+ 
+@@ -672,6 +673,10 @@
+ 	if (dev->netdev_ops && dev->netdev_ops->ndo_get_iflink)
+ 		return dev->netdev_ops->ndo_get_iflink(dev);
+ 
++	/* If dev->rtnl_link_ops is set, it's a virtual interface. */
++	if (dev->rtnl_link_ops)
++		return 0;
++
+ 	return dev->ifindex;
+ }
+ EXPORT_SYMBOL(dev_get_iflink);
+@@ -874,13 +879,13 @@
+  */
+ 
+ struct net_device *dev_getbyhwaddr_rcu(struct net *net, unsigned short type,
+-				       const char *ha)
++					   const char *ha)
+ {
+ 	struct net_device *dev;
+ 
+ 	for_each_netdev_rcu(net, dev)
+ 		if (dev->type == type &&
+-		    !memcmp(dev->dev_addr, ha, dev->addr_len))
++			!memcmp(dev->dev_addr, ha, dev->addr_len))
+ 			return dev;
+ 
+ 	return NULL;
+@@ -928,7 +933,7 @@
+  */
+ 
+ struct net_device *__dev_get_by_flags(struct net *net, unsigned short if_flags,
+-				      unsigned short mask)
++					  unsigned short mask)
+ {
+ 	struct net_device *dev, *ret;
+ 
+@@ -1067,8 +1072,8 @@
+ EXPORT_SYMBOL(dev_alloc_name);
+ 
+ static int dev_alloc_name_ns(struct net *net,
+-			     struct net_device *dev,
+-			     const char *name)
++				 struct net_device *dev,
++				 const char *name)
+ {
+ 	char buf[IFNAMSIZ];
+ 	int ret;
+@@ -1080,8 +1085,8 @@
+ }
+ 
+ static int dev_get_valid_name(struct net *net,
+-			      struct net_device *dev,
+-			      const char *name)
++				  struct net_device *dev,
++				  const char *name)
+ {
+ 	BUG_ON(!net);
+ 
+@@ -1180,7 +1185,7 @@
+ 			goto rollback;
+ 		} else {
+ 			pr_err("%s: name change rollback failed: %d\n",
+-			       dev->name, ret);
++				   dev->name, ret);
+ 		}
+ 	}
+ 
+@@ -1247,7 +1252,7 @@
+ 
+ 		change_info.flags_changed = 0;
+ 		call_netdevice_notifiers_info(NETDEV_CHANGE, dev,
+-					      &change_info.info);
++						  &change_info.info);
+ 		rtmsg_ifinfo(RTM_NEWLINK, dev, 0, GFP_KERNEL);
+ 	}
+ }
+@@ -1611,8 +1616,8 @@
+ 
+ /**
+  *	call_netdevice_notifiers - call all network notifier blocks
+- *      @val: value passed unmodified to notifier function
+- *      @dev: net_device pointer passed unmodified to notifier function
++ *	  @val: value passed unmodified to notifier function
++ *	  @dev: net_device pointer passed unmodified to notifier function
+  *
+  *	Call all network notifier blocks.  Parameters and return value
+  *	are as for raw_notifier_call_chain().
+@@ -1715,7 +1720,7 @@
+ int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
+ {
+ 	if (skb_orphan_frags(skb, GFP_ATOMIC) ||
+-	    unlikely(!is_skb_forwardable(dev, skb))) {
++		unlikely(!is_skb_forwardable(dev, skb))) {
+ 		atomic_long_inc(&dev->rx_dropped);
+ 		kfree_skb(skb);
+ 		return NET_RX_DROP;
+@@ -1738,7 +1743,7 @@
+  *
+  * return values:
+  *	NET_RX_SUCCESS	(no congestion)
+- *	NET_RX_DROP     (packet was dropped, but freed)
++ *	NET_RX_DROP	 (packet was dropped, but freed)
+  *
+  * dev_forward_skb can be used for injecting an skb from the
+  * start_xmit function of one device into the receive queue
+@@ -1755,8 +1760,8 @@
+ EXPORT_SYMBOL_GPL(dev_forward_skb);
+ 
+ static inline int deliver_skb(struct sk_buff *skb,
+-			      struct packet_type *pt_prev,
+-			      struct net_device *orig_dev)
++				  struct packet_type *pt_prev,
++				  struct net_device *orig_dev)
+ {
+ 	if (unlikely(skb_orphan_frags(skb, GFP_ATOMIC)))
+ 		return -ENOMEM;
+@@ -1836,10 +1841,10 @@
+ 		skb_reset_mac_header(skb2);
+ 
+ 		if (skb_network_header(skb2) < skb2->data ||
+-		    skb_network_header(skb2) > skb_tail_pointer(skb2)) {
++			skb_network_header(skb2) > skb_tail_pointer(skb2)) {
+ 			net_crit_ratelimited("protocol %04x is buggy, dev %s\n",
+-					     ntohs(skb2->protocol),
+-					     dev->name);
++						 ntohs(skb2->protocol),
++						 dev->name);
+ 			skb_reset_network_header(skb2);
+ 		}
+ 
+@@ -1954,14 +1959,14 @@
+ 
+ 	for (i = index; i < dev->num_tx_queues; i++)
+ 		netdev_queue_numa_node_write(netdev_get_tx_queue(dev, i),
+-					     NUMA_NO_NODE);
++						 NUMA_NO_NODE);
+ 
+ out_no_maps:
+ 	mutex_unlock(&xps_map_mutex);
+ }
+ 
+ static struct xps_map *expand_xps_map(struct xps_map *map,
+-				      int cpu, u16 index)
++					  int cpu, u16 index)
+ {
+ 	struct xps_map *new_map;
+ 	int alloc_len = XPS_MIN_MAP_ALLOC;
+@@ -1983,7 +1988,7 @@
+ 
+ 	/* Need to allocate new map to store queue on this CPU's map */
+ 	new_map = kzalloc_node(XPS_MAP_SIZE(alloc_len), GFP_KERNEL,
+-			       cpu_to_node(cpu));
++				   cpu_to_node(cpu));
+ 	if (!new_map)
+ 		return NULL;
+ 
+@@ -2078,8 +2083,8 @@
+ out_no_new_maps:
+ 	/* update Tx queue numa node */
+ 	netdev_queue_numa_node_write(netdev_get_tx_queue(dev, index),
+-				     (numa_node_id >= 0) ? numa_node_id :
+-				     NUMA_NO_NODE);
++					 (numa_node_id >= 0) ? numa_node_id :
++					 NUMA_NO_NODE);
+ 
+ 	if (!dev_maps)
+ 		goto out_no_maps;
+@@ -2133,7 +2138,7 @@
+ 		return -EINVAL;
+ 
+ 	if (dev->reg_state == NETREG_REGISTERED ||
+-	    dev->reg_state == NETREG_UNREGISTERING) {
++		dev->reg_state == NETREG_UNREGISTERING) {
+ 		ASSERT_RTNL();
+ 
+ 		rc = netdev_queue_update_kobjects(dev, dev->real_num_tx_queues,
+@@ -2317,7 +2322,7 @@
+ void netif_device_detach(struct net_device *dev)
+ {
+ 	if (test_and_clear_bit(__LINK_STATE_PRESENT, &dev->state) &&
+-	    netif_running(dev)) {
++		netif_running(dev)) {
+ 		netif_tx_stop_all_queues(dev);
+ 	}
+ }
+@@ -2332,7 +2337,7 @@
+ void netif_device_attach(struct net_device *dev)
+ {
+ 	if (!test_and_set_bit(__LINK_STATE_PRESENT, &dev->state) &&
+-	    netif_running(dev)) {
++		netif_running(dev)) {
+ 		netif_tx_wake_all_queues(dev);
+ 		__netdev_watchdog_up(dev);
+ 	}
+@@ -2352,11 +2357,11 @@
+ 		driver = dev_driver_string(dev->dev.parent);
+ 
+ 	WARN(1, "%s: caps=(%pNF, %pNF) len=%d data_len=%d gso_size=%d "
+-	     "gso_type=%d ip_summed=%d\n",
+-	     driver, dev ? &dev->features : &null_features,
+-	     skb->sk ? &skb->sk->sk_route_caps : &null_features,
+-	     skb->len, skb->data_len, skb_shinfo(skb)->gso_size,
+-	     skb_shinfo(skb)->gso_type, skb->ip_summed);
++		 "gso_type=%d ip_summed=%d\n",
++		 driver, dev ? &dev->features : &null_features,
++		 skb->sk ? &skb->sk->sk_route_caps : &null_features,
++		 skb->len, skb->data_len, skb_shinfo(skb)->gso_size,
++		 skb_shinfo(skb)->gso_type, skb->ip_summed);
+ }
+ 
+ /*
+@@ -2393,7 +2398,7 @@
+ 	BUG_ON(offset + sizeof(__sum16) > skb_headlen(skb));
+ 
+ 	if (skb_cloned(skb) &&
+-	    !skb_clone_writable(skb, offset + sizeof(__sum16))) {
++		!skb_clone_writable(skb, offset + sizeof(__sum16))) {
+ 		ret = pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
+ 		if (ret)
+ 			goto out;
+@@ -2431,7 +2436,7 @@
+  *	@features: features for the output path (see dev->features)
+  */
+ struct sk_buff *skb_mac_gso_segment(struct sk_buff *skb,
+-				    netdev_features_t features)
++					netdev_features_t features)
+ {
+ 	struct sk_buff *segs = ERR_PTR(-EPROTONOSUPPORT);
+ 	struct packet_offload *ptype;
+@@ -2479,8 +2484,6 @@
+  *
+  *	It may return NULL if the skb requires no segmentation.  This is
+  *	only possible when GSO is used for verifying header integrity.
+- *
+- *	Segmentation preserves SKB_SGO_CB_OFFSET bytes of previous skb cb.
+  */
+ struct sk_buff *__skb_gso_segment(struct sk_buff *skb,
+ 				  netdev_features_t features, bool tx_path)
+@@ -2495,9 +2498,6 @@
+ 			return ERR_PTR(err);
+ 	}
+ 
+-	BUILD_BUG_ON(SKB_SGO_CB_OFFSET +
+-		     sizeof(*SKB_GSO_CB(skb)) > sizeof(skb->cb));
+-
+ 	SKB_GSO_CB(skb)->mac_offset = skb_headroom(skb);
+ 	SKB_GSO_CB(skb)->encap_level = 0;
+ 
+@@ -2585,7 +2585,7 @@
+ 	features = net_mpls_features(skb, features, type);
+ 
+ 	if (skb->ip_summed != CHECKSUM_NONE &&
+-	    !can_checksum_protocol(features, type)) {
++		!can_checksum_protocol(features, type)) {
+ 		features &= ~NETIF_F_ALL_CSUM;
+ 	} else if (illegal_highdma(skb->dev, skb)) {
+ 		features &= ~NETIF_F_SG;
+@@ -2603,8 +2603,8 @@
+ EXPORT_SYMBOL(passthru_features_check);
+ 
+ static netdev_features_t dflt_features_check(const struct sk_buff *skb,
+-					     struct net_device *dev,
+-					     netdev_features_t features)
++						 struct net_device *dev,
++						 netdev_features_t features)
+ {
+ 	return vlan_features_check(skb, features);
+ }
+@@ -2627,9 +2627,9 @@
+ 
+ 	if (skb_vlan_tagged(skb))
+ 		features = netdev_intersect_features(features,
+-						     dev->vlan_features |
+-						     NETIF_F_HW_VLAN_CTAG_TX |
+-						     NETIF_F_HW_VLAN_STAG_TX);
++							 dev->vlan_features |
++							 NETIF_F_HW_VLAN_CTAG_TX |
++							 NETIF_F_HW_VLAN_STAG_TX);
+ 
+ 	if (dev->netdev_ops->ndo_features_check)
+ 		features &= dev->netdev_ops->ndo_features_check(skb, dev,
+@@ -2642,7 +2642,7 @@
+ EXPORT_SYMBOL(netif_skb_features);
+ 
+ static int xmit_one(struct sk_buff *skb, struct net_device *dev,
+-		    struct netdev_queue *txq, bool more)
++			struct netdev_queue *txq, bool more)
+ {
+ 	unsigned int len;
+ 	int rc;
+@@ -2659,7 +2659,7 @@
+ }
+ 
+ struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *dev,
+-				    struct netdev_queue *txq, int *ret)
++					struct netdev_queue *txq, int *ret)
+ {
+ 	struct sk_buff *skb = first;
+ 	int rc = NETDEV_TX_OK;
+@@ -2690,7 +2690,7 @@
+ 					  netdev_features_t features)
+ {
+ 	if (skb_vlan_tag_present(skb) &&
+-	    !vlan_hw_offload_capable(features, skb->vlan_proto))
++		!vlan_hw_offload_capable(features, skb->vlan_proto))
+ 		skb = __vlan_hwaccel_push_inside(skb);
+ 	return skb;
+ }
+@@ -2719,7 +2719,7 @@
+ 		}
+ 	} else {
+ 		if (skb_needs_linearize(skb, features) &&
+-		    __skb_linearize(skb))
++			__skb_linearize(skb))
+ 			goto out_kfree_skb;
+ 
+ 		/* If packet is not checksummed and device does not
+@@ -2729,12 +2729,12 @@
+ 		if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ 			if (skb->encapsulation)
+ 				skb_set_inner_transport_header(skb,
+-							       skb_checksum_start_offset(skb));
++								   skb_checksum_start_offset(skb));
+ 			else
+ 				skb_set_transport_header(skb,
+ 							 skb_checksum_start_offset(skb));
+ 			if (!(features & NETIF_F_ALL_CSUM) &&
+-			    skb_checksum_help(skb))
++				skb_checksum_help(skb))
+ 				goto out_kfree_skb;
+ 		}
+ 	}
+@@ -2916,17 +2916,17 @@
+  *	to congestion or traffic shaping.
+  *
+  * -----------------------------------------------------------------------------------
+- *      I notice this method can also return errors from the queue disciplines,
+- *      including NET_XMIT_DROP, which is a positive value.  So, errors can also
+- *      be positive.
+- *
+- *      Regardless of the return value, the skb is consumed, so it is currently
+- *      difficult to retry a send to this method.  (You can bump the ref count
+- *      before sending to hold a reference for retry if you are careful.)
+- *
+- *      When calling this method, interrupts MUST be enabled.  This is because
+- *      the BH enable code must have IRQs enabled so that it will not deadlock.
+- *          --BLG
++ *	  I notice this method can also return errors from the queue disciplines,
++ *	  including NET_XMIT_DROP, which is a positive value.  So, errors can also
++ *	  be positive.
++ *
++ *	  Regardless of the return value, the skb is consumed, so it is currently
++ *	  difficult to retry a send to this method.  (You can bump the ref count
++ *	  before sending to hold a reference for retry if you are careful.)
++ *
++ *	  When calling this method, interrupts MUST be enabled.  This is because
++ *	  the BH enable code must have IRQs enabled so that it will not deadlock.
++ *		  --BLG
+  */
+ static int __dev_queue_xmit(struct sk_buff *skb, void *accel_priv)
+ {
+@@ -3004,14 +3004,14 @@
+ 			}
+ 			HARD_TX_UNLOCK(dev, txq);
+ 			net_crit_ratelimited("Virtual device %s asks to queue packet!\n",
+-					     dev->name);
++						 dev->name);
+ 		} else {
+ 			/* Recursion is detected! It is possible,
+ 			 * unfortunately
+ 			 */
+ recursion_alert:
+ 			net_crit_ratelimited("Dead loop on virtual device %s, fix it urgently!\n",
+-					     dev->name);
++						 dev->name);
+ 		}
+ 	}
+ 
+@@ -3049,11 +3049,11 @@
+ 
+ int netdev_tstamp_prequeue __read_mostly = 1;
+ int netdev_budget __read_mostly = 300;
+-int weight_p __read_mostly = 64;            /* old backlog weight */
++int weight_p __read_mostly = 64;			/* old backlog weight */
+ 
+ /* Called with irq disabled */
+ static inline void ____napi_schedule(struct softnet_data *sd,
+-				     struct napi_struct *napi)
++					 struct napi_struct *napi)
+ {
+ 	list_add_tail(&napi->poll_list, &sd->poll_list);
+ 	__raise_softirq_irqoff(NET_RX_SOFTIRQ);
+@@ -3071,7 +3071,7 @@
+ 
+ static struct rps_dev_flow *
+ set_rps_cpu(struct net_device *dev, struct sk_buff *skb,
+-	    struct rps_dev_flow *rflow, u16 next_cpu)
++		struct rps_dev_flow *rflow, u16 next_cpu)
+ {
+ 	if (next_cpu < nr_cpu_ids) {
+ #ifdef CONFIG_RFS_ACCEL
+@@ -3084,7 +3084,7 @@
+ 
+ 		/* Should we steer this flow to a different hardware queue? */
+ 		if (!skb_rx_queue_recorded(skb) || !dev->rx_cpu_rmap ||
+-		    !(dev->features & NETIF_F_NTUPLE))
++			!(dev->features & NETIF_F_NTUPLE))
+ 			goto out;
+ 		rxq_index = cpu_rmap_lookup_index(dev->rx_cpu_rmap, next_cpu);
+ 		if (rxq_index == skb_get_rx_queue(skb))
+@@ -3120,7 +3120,7 @@
+  * rcu_read_lock must be held on entry.
+  */
+ static int get_rps_cpu(struct net_device *dev, struct sk_buff *skb,
+-		       struct rps_dev_flow **rflowp)
++			   struct rps_dev_flow **rflowp)
+ {
+ 	const struct rps_sock_flow_table *sock_flow_table;
+ 	struct netdev_rx_queue *rxqueue = dev->_rx;
+@@ -3181,14 +3181,14 @@
+ 		 *   - Current CPU is unset (>= nr_cpu_ids).
+ 		 *   - Current CPU is offline.
+ 		 *   - The current CPU's queue tail has advanced beyond the
+-		 *     last packet that was enqueued using this table entry.
+-		 *     This guarantees that all previous packets for the flow
+-		 *     have been dequeued, thus preserving in order delivery.
++		 *	 last packet that was enqueued using this table entry.
++		 *	 This guarantees that all previous packets for the flow
++		 *	 have been dequeued, thus preserving in order delivery.
+ 		 */
+ 		if (unlikely(tcpu != next_cpu) &&
+-		    (tcpu >= nr_cpu_ids || !cpu_online(tcpu) ||
+-		     ((int)(per_cpu(softnet_data, tcpu).input_queue_head -
+-		      rflow->last_qtail)) >= 0)) {
++			(tcpu >= nr_cpu_ids || !cpu_online(tcpu) ||
++			 ((int)(per_cpu(softnet_data, tcpu).input_queue_head -
++			  rflow->last_qtail)) >= 0)) {
+ 			tcpu = next_cpu;
+ 			rflow = set_rps_cpu(dev, skb, rflow, next_cpu);
+ 		}
+@@ -3242,9 +3242,9 @@
+ 		rflow = &flow_table->flows[flow_id];
+ 		cpu = ACCESS_ONCE(rflow->cpu);
+ 		if (rflow->filter == filter_id && cpu < nr_cpu_ids &&
+-		    ((int)(per_cpu(softnet_data, cpu).input_queue_head -
++			((int)(per_cpu(softnet_data, cpu).input_queue_head -
+ 			   rflow->last_qtail) <
+-		     (int)(10 * flow_table->mask)))
++			 (int)(10 * flow_table->mask)))
+ 			expire = false;
+ 	}
+ 	rcu_read_unlock();
+@@ -3331,7 +3331,7 @@
+  * queue (may be a remote CPU queue).
+  */
+ static int enqueue_to_backlog(struct sk_buff *skb, int cpu,
+-			      unsigned int *qtail)
++				  unsigned int *qtail)
+ {
+ 	struct softnet_data *sd;
+ 	unsigned long flags;
+@@ -3342,8 +3342,6 @@
+ 	local_irq_save(flags);
+ 
+ 	rps_lock(sd);
+-	if (!netif_running(skb->dev))
+-		goto drop;
+ 	qlen = skb_queue_len(&sd->input_pkt_queue);
+ 	if (qlen <= netdev_max_backlog && !skb_flow_limit(skb, qlen)) {
+ 		if (qlen) {
+@@ -3365,7 +3363,6 @@
+ 		goto enqueue;
+ 	}
+ 
+-drop:
+ 	sd->dropped++;
+ 	rps_unlock(sd);
+ 
+@@ -3420,7 +3417,7 @@
+  *
+  *	return values:
+  *	NET_RX_SUCCESS	(no congestion)
+- *	NET_RX_DROP     (packet was dropped)
++ *	NET_RX_DROP	 (packet was dropped)
+  *
+  */
+ 
+@@ -3497,7 +3494,7 @@
+ 				spin_unlock(root_lock);
+ 			} else {
+ 				if (!test_bit(__QDISC_STATE_DEACTIVATED,
+-					      &q->state)) {
++						  &q->state)) {
+ 					__netif_reschedule(q);
+ 				} else {
+ 					smp_mb__before_atomic();
+@@ -3510,10 +3507,10 @@
+ }
+ 
+ #if (defined(CONFIG_BRIDGE) || defined(CONFIG_BRIDGE_MODULE)) && \
+-    (defined(CONFIG_ATM_LANE) || defined(CONFIG_ATM_LANE_MODULE))
++	(defined(CONFIG_ATM_LANE) || defined(CONFIG_ATM_LANE_MODULE))
+ /* This hook is defined here for ATM LANE */
+ int (*br_fdb_test_addr_hook)(struct net_device *dev,
+-			     unsigned char *addr) __read_mostly;
++				 unsigned char *addr) __read_mostly;
+ EXPORT_SYMBOL_GPL(br_fdb_test_addr_hook);
+ #endif
+ 
+@@ -3535,7 +3532,7 @@
+ 
+ 	if (unlikely(MAX_RED_LOOP < ttl++)) {
+ 		net_warn_ratelimited("Redir loop detected Dropping packet (%d->%d)\n",
+-				     skb->skb_iif, dev->ifindex);
++					 skb->skb_iif, dev->ifindex);
+ 		return TC_ACT_SHOT;
+ 	}
+ 
+@@ -3593,8 +3590,8 @@
+  *	For a general description of rx_handler, see enum rx_handler_result.
+  */
+ int netdev_rx_handler_register(struct net_device *dev,
+-			       rx_handler_func_t *rx_handler,
+-			       void *rx_handler_data)
++				   rx_handler_func_t *rx_handler,
++				   void *rx_handler_data)
+ {
+ 	ASSERT_RTNL();
+ 
+@@ -3671,16 +3668,18 @@
+ 
+ 	pt_prev = NULL;
+ 
++	rcu_read_lock();
++
+ another_round:
+ 	skb->skb_iif = skb->dev->ifindex;
+ 
+ 	__this_cpu_inc(softnet_data.processed);
+ 
+ 	if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
+-	    skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
++		skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
+ 		skb = skb_vlan_untag(skb);
+ 		if (unlikely(!skb))
+-			goto out;
++			goto unlock;
+ 	}
+ 
+ #ifdef CONFIG_NET_CLS_ACT
+@@ -3710,7 +3709,7 @@
+ 	if (static_key_false(&ingress_needed)) {
+ 		skb = handle_ing(skb, &pt_prev, &ret, orig_dev);
+ 		if (!skb)
+-			goto out;
++			goto unlock;
+ 	}
+ 
+ 	skb->tc_verd = 0;
+@@ -3727,7 +3726,7 @@
+ 		if (vlan_do_receive(&skb))
+ 			goto another_round;
+ 		else if (unlikely(!skb))
+-			goto out;
++			goto unlock;
+ 	}
+ 
+ 	rx_handler = rcu_dereference(skb->dev->rx_handler);
+@@ -3739,7 +3738,7 @@
+ 		switch (rx_handler(&skb)) {
+ 		case RX_HANDLER_CONSUMED:
+ 			ret = NET_RX_SUCCESS;
+-			goto out;
++			goto unlock;
+ 		case RX_HANDLER_ANOTHER:
+ 			goto another_round;
+ 		case RX_HANDLER_EXACT:
+@@ -3766,16 +3765,16 @@
+ 	/* deliver only exact match when indicated */
+ 	if (likely(!deliver_exact)) {
+ 		deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+-				       &ptype_base[ntohs(type) &
++					   &ptype_base[ntohs(type) &
+ 						   PTYPE_HASH_MASK]);
+ 	}
+ 
+ 	deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+-			       &orig_dev->ptype_specific);
++				   &orig_dev->ptype_specific);
+ 
+ 	if (unlikely(skb->dev != orig_dev)) {
+ 		deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+-				       &skb->dev->ptype_specific);
++					   &skb->dev->ptype_specific);
+ 	}
+ 
+ 	if (pt_prev) {
+@@ -3793,7 +3792,8 @@
+ 		ret = NET_RX_DROP;
+ 	}
+ 
+-out:
++unlock:
++	rcu_read_unlock();
+ 	return ret;
+ }
+ 
+@@ -3822,33 +3822,33 @@
  	return ret;
  }
  
 -static int netif_receive_skb_internal(struct sk_buff *skb)
 +int netif_receive_skb_internal(struct sk_buff *skb)
  {
+-	int ret;
+-
  	net_timestamp_check(netdev_tstamp_prequeue, skb);
  
-@@ -3811,6 +3812,7 @@
+ 	if (skb_defer_rx_timestamp(skb))
+ 		return NET_RX_SUCCESS;
+ 
+-	rcu_read_lock();
+-
+ #ifdef CONFIG_RPS
+ 	if (static_key_false(&rps_needed)) {
+ 		struct rps_dev_flow voidflow, *rflow = &voidflow;
+-		int cpu = get_rps_cpu(skb->dev, skb, &rflow);
++		int cpu, ret;
++
++		rcu_read_lock();
++
++		cpu = get_rps_cpu(skb->dev, skb, &rflow);
+ 
+ 		if (cpu >= 0) {
+ 			ret = enqueue_to_backlog(skb, cpu, &rflow->last_qtail);
+ 			rcu_read_unlock();
+ 			return ret;
+ 		}
++		rcu_read_unlock();
+ 	}
  #endif
- 	return __netif_receive_skb(skb);
+-	ret = __netif_receive_skb(skb);
+-	rcu_read_unlock();
+-	return ret;
++	return __netif_receive_skb(skb);
  }
 +EXPORT_SYMBOL(netif_receive_skb_internal);
  
  /**
   *	netif_receive_skb - process receive buffer from network
-@@ -3863,7 +3865,7 @@
+@@ -3901,7 +3901,7 @@
  	}
  }
  
@@ -134,109 +1064,117 @@ diff -Naur linux-3.18.5/net/core/dev.c linux-3.18.5-juggler/net/core/dev.c
  {
  	struct packet_offload *ptype;
  	__be16 type = skb->protocol;
-@@ -3897,13 +3899,114 @@
+@@ -3935,32 +3935,165 @@
  	return netif_receive_skb_internal(skb);
  }
  
 +static __u32 max_seq(__u32 seq1, __u32 seq2) {
-+        if (before(seq1, seq2)) {
-+                return seq2;
-+        } else {
-+                return seq1;
-+        }
++		if (before(seq1, seq2)) {
++				return seq2;
++		} else {
++				return seq1;
++		}
 +}
 +
-+static struct sk_buff* dev_gro_complete(struct napi_struct *napi, struct sk_buff *skb, u64 timeout) {
++static struct sk_buff* dev_gro_complete(struct napi_struct *napi, struct sk_buff *skb, bool flush_old) {
 +
-+	struct sk_buff_head_gro *ofo_queue = NAPI_GRO_CB(skb)->out_of_order_queue;
-+	struct sk_buff *p = ofo_queue->next, *p2, *pl = ofo_queue->prev, *skb_last = NULL;
-+	unsigned qlen = 0, skb_num = 0;
-+	u64 timestamp = ktime_to_ns(ktime_get());
++		struct sk_buff_head_gro *ofo_queue = NAPI_GRO_CB(skb)->out_of_order_queue;
++		struct sk_buff *p = ofo_queue->next, *p2;
++		unsigned qlen = 0, skb_num = 0;
++		bool flushed = false;
++		u64 timestamp = ktime_to_ns(ktime_get());
++		u64 age;
++		bool has_inseq;
 +
-+	if (ofo_queue == NULL) {
-+		napi_gro_complete(skb);
-+		return NULL;
-+	}
++		if (ofo_queue == NULL) {
++				napi_gro_complete(skb);
++				return NULL;
++		}
 +
-+	if (timeout != 0) {
-+		while (pl != NULL) {
-+			if (timestamp - NAPI_GRO_CB(pl)->timestamp < timeout) {
-+				skb_last = pl;
-+				pl = NAPI_GRO_CB(pl)->prev;
-+			} else {
-+				printk(KERN_NOTICE "age: %u\n", timestamp - NAPI_GRO_CB(pl)->timestamp);
-+				break;
++		age = timestamp - ofo_queue->timestamp;
++		printk(KERN_INFO "queue age: %llu\n", age);
++
++		has_inseq = !before(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq);
++
++		if (!flush_old || (!has_inseq && age > napi->dev->gro_ofo_timeout)) {
++			while (p != NULL) {
++				p2 = NAPI_GRO_CB(p)->next;
++				if (p2)
++					NAPI_GRO_CB(p2)->prev = NULL;
++
++				qlen += NAPI_GRO_CB(p)->len;
++				skb_num++;
++
++				ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
++				ofo_queue->skb_num--;
++				ofo_queue->seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len);
++				napi_gro_complete(p);
++				flushed = true;
++				p = p2;
++			}
++		} else if (has_inseq && age > napi->dev->gro_inseq_timeout) {
++			while (p != NULL && !before(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq)) {
++					p2 = NAPI_GRO_CB(p)->next;
++					if (p2)
++							NAPI_GRO_CB(p2)->prev = NULL;	
++
++					qlen += NAPI_GRO_CB(p)->len;
++					skb_num++;	
++
++					ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
++					ofo_queue->skb_num--;
++					ofo_queue->seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len);
++					napi_gro_complete(p);
++					flushed = true;
++					p = p2;
++					printk(KERN_NOTICE "flush in sequence skb\n");
 +			}
 +		}
-+	}
 +
-+	while (p != skb_last) {
-+		p2 = NAPI_GRO_CB(p)->next;
-+		if (p2)
-+			NAPI_GRO_CB(p2)->prev = NULL;
-+
-+		qlen += NAPI_GRO_CB(p)->len;
-+		skb_num++;
-+
-+		ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
-+		ofo_queue->skb_num--;
-+		ofo_queue->seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len);
-+		napi_gro_complete(p);
-+		p = p2;
-+	}
-+
-+	while (p != NULL && !before(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq)) {
-+		p2 = NAPI_GRO_CB(p)->next;
-+		if (p2)
-+			NAPI_GRO_CB(p2)->prev = NULL;
-+
-+		qlen += NAPI_GRO_CB(p)->len;
-+		skb_num++;
-+
-+		ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
-+		ofo_queue->skb_num--;
-+		ofo_queue->seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len);
-+		napi_gro_complete(p);
-+		p = p2;
-+		printk(KERN_NOTICE "flush in sequence skb\n");
-+	}
-+
-+	if (p == NULL) {
-+		ofo_queue->age = jiffies;
-+		ofo_queue->prev_queue = NULL;
-+		ofo_queue->next_queue = napi->out_of_order_queue_list;
-+		if (napi->out_of_order_queue_list) {
-+			napi->out_of_order_queue_list->prev_queue = ofo_queue;
++		if (flushed) {
++			ofo_queue->timestamp = timestamp;
++			ofo_queue->flushed = true;
 +		}
-+		napi->out_of_order_queue_list = ofo_queue;
-+	} else {
-+		ofo_queue->next = p;
-+	}
 +
-+	if (timeout != 0) {
-+		printk(KERN_NOTICE "napi_gro_flush qlen %u skb %u\n", qlen, skb_num);
-+	}
++		if (p == NULL) {
++				//ofo_queue->age = jiffies;
++				ofo_queue->prev_queue = NULL;
++				ofo_queue->next_queue = napi->out_of_order_queue_list;
++				if (napi->out_of_order_queue_list) {
++					napi->out_of_order_queue_list->prev_queue = ofo_queue;
++				} else {
++					napi->out_of_order_queue_last = ofo_queue;
++				}
++				napi->out_of_order_queue_list = ofo_queue;
++		} else {
++				ofo_queue->next = p;
++		}
++		
++		printk(KERN_NOTICE "dev_gro_complete qlen %u skb %u\n", qlen, skb_num);
 +
-+	//printk(KERN_ERR "seq_next %u\n", ofo_queue->seq_next);
++		//printk(KERN_ERR "seq_next %u\n", ofo_queue->seq_next);
 +
-+	return p;
++		return p;
 +}
 +
-+
 +void napi_clean_tcp_ofo_queue(struct napi_struct *napi) {
-+	struct sk_buff_head_gro *ofo_queue, *ofo_queue2;
++		struct sk_buff_head_gro *ofo_queue, *ofo_queue2;
++		u64 timestamp = ktime_to_ns(ktime_get());
 +
-+	ofo_queue = napi->out_of_order_queue_list;
-+	while (ofo_queue) {
-+		ofo_queue2 = ofo_queue->next_queue;
++		ofo_queue = napi->out_of_order_queue_list;
++		while (ofo_queue) {
++				ofo_queue2 = ofo_queue->next_queue;
 +
-+		if (jiffies - ofo_queue->age > HZ) {
-+			ofo_queue->age = 0;
-+			ofo_queue->hash = 0;
++				if (timestamp - ofo_queue->timestamp > 100000000) {
++						ofo_queue->timestamp = 0;
++						ofo_queue->hash = 0;
++						ofo_queue->seq_next = 0;
++						ofo_queue->qlen = 0;
++						ofo_queue->skb_num = 0;
++				}
++
++				ofo_queue = ofo_queue2;
 +		}
-+
-+		ofo_queue = ofo_queue2;
-+	}
 +}
 +
  /* napi->gro_list contains packets ordered by age.
@@ -246,258 +1184,426 @@ diff -Naur linux-3.18.5/net/core/dev.c linux-3.18.5-juggler/net/core/dev.c
  void napi_gro_flush(struct napi_struct *napi, bool flush_old)
  {
 -	struct sk_buff *skb, *prev = NULL;
-+	struct sk_buff *skb, *prev = NULL, *gro_list_old = napi->gro_list, *p, *skb_new;
++		struct sk_buff *skb, *prev = NULL, *p, *skb_new;
  
- 	/* scan list and build reverse chain */
- 	for (skb = napi->gro_list; skb != NULL; skb = skb->next) {
-@@ -3911,18 +4014,53 @@
- 		prev = skb;
- 	}
+-	/* scan list and build reverse chain */
+-	for (skb = napi->gro_list; skb != NULL; skb = skb->next) {
+-		skb->prev = prev;
+-		prev = skb;
+-	}
++		/* scan list and build reverse chain */
++		for (skb = napi->gro_list; skb != NULL; skb = skb->next) {
++				skb->prev = prev;
++				prev = skb;
++		}
  
-+	napi->gro_list = NULL;
-+
- 	for (skb = prev; skb; skb = prev) {
+-	for (skb = prev; skb; skb = prev) {
 -		skb->next = NULL;
-+		//skb->next = NULL;
++		napi->gro_list = NULL;
  
 -		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies)
-+		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies) {
-+			napi->gro_list = gro_list_old;
- 			return;
-+		}
+-			return;
++		for (skb = prev; skb; skb = prev) {
  
- 		prev = skb->prev;
+-		prev = skb->prev;
 -		napi_gro_complete(skb);
 -		napi->gro_count--;
-+
-+		if (!NAPI_GRO_CB(skb)->out_of_order_queue) {
-+
-+			if (prev != NULL) {
-+				prev->next = skb->next;
-+			}
-+
-+			skb->prev = NULL;
-+			skb->next = NULL;
-+			dev_gro_complete(napi, skb, 0);
-+			napi->gro_count--;
-+		} else {
-+			
-+			p = skb->next;
-+			skb_new = dev_gro_complete(napi, skb, 100000);
-+			if (!skb_new) {
-+				if (prev != NULL) {
-+					prev->next = p;
-+				}
-+
-+				napi->gro_count--;
-+			} else {
-+				if (prev != NULL) {
-+					prev->next = skb_new;
-+				}
-+				skb_new->next = p;
-+				napi->gro_list = skb_new;
-+			}
-+		}
- 	}
+-	}
++				prev = skb->prev;
  
 -	napi->gro_list = NULL;
-+	if (napi->gro_list) {
-+		hrtimer_start(&napi->timer, ktime_set(0, 1E5), HRTIMER_MODE_REL_PINNED);
-+	}
++				if (!NAPI_GRO_CB(skb)->out_of_order_queue) {
 +
-+	//napi->gro_list = NULL;
++						if (prev != NULL) {
++								prev->next = skb->next;
++						}
++
++						skb->prev = NULL;
++						skb->next = NULL;
++						dev_gro_complete(napi, skb, false);
++						napi->gro_count--;
++				} else {
++
++						p = skb->next;
++						printk(KERN_INFO "napi_gro_flush\n");
++						skb_new = dev_gro_complete(napi, skb, flush_old);
++						if (!skb_new) {
++								if (prev != NULL) {
++										prev->next = p;
++								}
++
++								napi->gro_count--;
++						} else {
++								if (prev != NULL) {
++										prev->next = skb_new;
++								}
++								skb_new->next = p;
++								napi->gro_list = skb_new;
++						}
++				}
++		}
  }
  EXPORT_SYMBOL(napi_gro_flush);
  
-@@ -3993,6 +4131,27 @@
+@@ -3984,11 +4117,11 @@
+ 		diffs |= p->vlan_tci ^ skb->vlan_tci;
+ 		if (maclen == ETH_HLEN)
+ 			diffs |= compare_ether_header(skb_mac_header(p),
+-						      skb_mac_header(skb));
++							  skb_mac_header(skb));
+ 		else if (!diffs)
+ 			diffs = memcmp(skb_mac_header(p),
+-				       skb_mac_header(skb),
+-				       maclen);
++					   skb_mac_header(skb),
++					   maclen);
+ 		NAPI_GRO_CB(p)->same_flow = !diffs;
+ 	}
+ }
+@@ -4003,8 +4136,8 @@
+ 	NAPI_GRO_CB(skb)->frag0_len = 0;
+ 
+ 	if (skb_mac_header(skb) == skb_tail_pointer(skb) &&
+-	    pinfo->nr_frags &&
+-	    !PageHighMem(skb_frag_page(frag0))) {
++		pinfo->nr_frags &&
++		!PageHighMem(skb_frag_page(frag0))) {
+ 		NAPI_GRO_CB(skb)->frag0 = skb_frag_address(frag0);
+ 		NAPI_GRO_CB(skb)->frag0_len = skb_frag_size(frag0);
+ 	}
+@@ -4031,113 +4164,249 @@
  	}
  }
  
 +static struct sk_buff_head_gro* napi_get_tcp_ofo_queue(struct napi_struct *napi, struct sk_buff *skb) {
-+	struct sk_buff_head_gro *ofo_queue, *ofo_queue_last = NULL;
++		struct sk_buff_head_gro *ofo_queue, *ofo_queue_last = NULL;
 +
-+	ofo_queue = napi->out_of_order_queue_list;
-+	while (ofo_queue) {
-+		if (ofo_queue->hash == NAPI_GRO_CB(skb)->tcp_hash)
-+			return ofo_queue;
++		ofo_queue = napi->out_of_order_queue_list;
++		while (ofo_queue) {
++				if (ofo_queue->hash == NAPI_GRO_CB(skb)->tcp_hash || ofo_queue->hash == 0)
++						return ofo_queue;
 +
-+		ofo_queue_last = ofo_queue;
-+		ofo_queue = ofo_queue->next_queue;
-+	}
++				ofo_queue_last = ofo_queue;
++				ofo_queue = ofo_queue->next_queue;
++		}
 +
-+	ofo_queue_last->age = 0;
-+	ofo_queue_last->hash = 0;
-+	ofo_queue_last->qlen = 0;
-+	ofo_queue_last->skb_num = 0;
-+	ofo_queue_last->seq_next = 0;
++		ofo_queue_last->timestamp = 0;
++		ofo_queue_last->hash = 0;
++		ofo_queue_last->qlen = 0;
++		ofo_queue_last->skb_num = 0;
++		ofo_queue_last->seq_next = 0;
 +
-+	return ofo_queue_last;
++		return ofo_queue_last;
 +}
 +
  static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
  {
- 	struct sk_buff **pp = NULL;
-@@ -4002,6 +4161,9 @@
- 	int same_flow;
- 	enum gro_result ret;
- 	int grow;
-+	struct sk_buff_head_gro *ofo_queue;
+-	struct sk_buff **pp = NULL;
+-	struct packet_offload *ptype;
+-	__be16 type = skb->protocol;
+-	struct list_head *head = &offload_base;
+-	int same_flow;
+-	enum gro_result ret;
+-	int grow;
++		struct sk_buff **pp = NULL;
++		struct packet_offload *ptype;
++		__be16 type = skb->protocol;
++		struct list_head *head = &offload_base;
++		int same_flow;
++		enum gro_result ret;
++		int grow;
++		struct sk_buff_head_gro *ofo_queue;
++		u32 seq_next;
 +
-+	NAPI_GRO_CB(skb)->out_of_order_queue = NULL;
++		NAPI_GRO_CB(skb)->out_of_order_queue = NULL;
  
- 	if (!(skb->dev->features & NETIF_F_GRO))
- 		goto normal;
-@@ -4022,6 +4184,7 @@
- 		NAPI_GRO_CB(skb)->flush = 0;
- 		NAPI_GRO_CB(skb)->free = 0;
- 		NAPI_GRO_CB(skb)->udp_mark = 0;
-+		NAPI_GRO_CB(skb)->is_tcp = false;
+-	if (!(skb->dev->features & NETIF_F_GRO))
+-		goto normal;
++		if (!(skb->dev->features & NETIF_F_GRO))
++				goto normal;
  
- 		/* Setup for GRO checksum validation */
- 		switch (skb->ip_summed) {
-@@ -4055,15 +4218,106 @@
+-	if (skb_is_gso(skb) || skb_has_frag_list(skb) || skb->csum_bad)
+-		goto normal;
++		if (skb_is_gso(skb) || skb_has_frag_list(skb) || skb->csum_bad)
++				goto normal;
  
- 		*pp = nskb->next;
- 		nskb->next = NULL;
+-	gro_list_prepare(napi, skb);
++		gro_list_prepare(napi, skb);
+ 
+-	rcu_read_lock();
+-	list_for_each_entry_rcu(ptype, head, list) {
+-		if (ptype->type != type || !ptype->callbacks.gro_receive)
+-			continue;
++		rcu_read_lock();
++		list_for_each_entry_rcu(ptype, head, list) {
++				if (ptype->type != type || !ptype->callbacks.gro_receive)
++						continue;
++
++				skb_set_network_header(skb, skb_gro_offset(skb));
++				skb_reset_mac_len(skb);
++				NAPI_GRO_CB(skb)->gso_end = 0;
++				NAPI_GRO_CB(skb)->same_flow = 0;
++				NAPI_GRO_CB(skb)->flush = 0;
++				NAPI_GRO_CB(skb)->free = 0;
++				NAPI_GRO_CB(skb)->udp_mark = 0;
++				NAPI_GRO_CB(skb)->gro_remcsum_start = 0;
++				NAPI_GRO_CB(skb)->is_tcp = false;
++
++				/* Setup for GRO checksum validation */
++				switch (skb->ip_summed) {
++				case CHECKSUM_COMPLETE:
++						NAPI_GRO_CB(skb)->csum = skb->csum;
++						NAPI_GRO_CB(skb)->csum_valid = 1;
++						NAPI_GRO_CB(skb)->csum_cnt = 0;
++						break;
++				case CHECKSUM_UNNECESSARY:
++						NAPI_GRO_CB(skb)->csum_cnt = skb->csum_level + 1;
++						NAPI_GRO_CB(skb)->csum_valid = 0;
++						break;
++				default:
++						NAPI_GRO_CB(skb)->csum_cnt = 0;
++						NAPI_GRO_CB(skb)->csum_valid = 0;
++				}
+ 
+-		skb_set_network_header(skb, skb_gro_offset(skb));
+-		skb_reset_mac_len(skb);
+-		NAPI_GRO_CB(skb)->same_flow = 0;
+-		NAPI_GRO_CB(skb)->flush = 0;
+-		NAPI_GRO_CB(skb)->free = 0;
+-		NAPI_GRO_CB(skb)->udp_mark = 0;
+-		NAPI_GRO_CB(skb)->gro_remcsum_start = 0;
+-
+-		/* Setup for GRO checksum validation */
+-		switch (skb->ip_summed) {
+-		case CHECKSUM_COMPLETE:
+-			NAPI_GRO_CB(skb)->csum = skb->csum;
+-			NAPI_GRO_CB(skb)->csum_valid = 1;
+-			NAPI_GRO_CB(skb)->csum_cnt = 0;
+-			break;
+-		case CHECKSUM_UNNECESSARY:
+-			NAPI_GRO_CB(skb)->csum_cnt = skb->csum_level + 1;
+-			NAPI_GRO_CB(skb)->csum_valid = 0;
+-			break;
+-		default:
+-			NAPI_GRO_CB(skb)->csum_cnt = 0;
+-			NAPI_GRO_CB(skb)->csum_valid = 0;
++				pp = ptype->callbacks.gro_receive(&napi->gro_list, skb);
++				break;
+ 		}
++		rcu_read_unlock();
+ 
+-		pp = ptype->callbacks.gro_receive(&napi->gro_list, skb);
+-		break;
+-	}
+-	rcu_read_unlock();
++		if (&ptype->list == head)
++				goto normal;
+ 
+-	if (&ptype->list == head)
+-		goto normal;
++		same_flow = NAPI_GRO_CB(skb)->same_flow;
++		ret = NAPI_GRO_CB(skb)->free ? GRO_MERGED_FREE : GRO_MERGED;
+ 
+-	same_flow = NAPI_GRO_CB(skb)->same_flow;
+-	ret = NAPI_GRO_CB(skb)->free ? GRO_MERGED_FREE : GRO_MERGED;
++		if (pp) {
++				struct sk_buff *nskb = *pp;
+ 
+-	if (pp) {
+-		struct sk_buff *nskb = *pp;
++				*pp = nskb->next;
++				nskb->next = NULL;
++				printk(KERN_NOTICE "dev_gro_receive qlen %u skb %u\n", NAPI_GRO_CB(nskb)->out_of_order_queue->qlen, NAPI_GRO_CB(nskb)->out_of_order_queue->skb_num);
++				dev_gro_complete(napi, nskb, false);
++				napi->gro_count--;
++		}
++
++		if (same_flow) {
++				if (NAPI_GRO_CB(skb)->free)
++						goto ok;
++				else
++						goto pull;
++		}
++
++		if (NAPI_GRO_CB(skb)->flush) {
++				if (NAPI_GRO_CB(skb)->is_tcp && !NAPI_GRO_CB(skb)->out_of_order_queue) {
++						ofo_queue = napi_get_tcp_ofo_queue(napi, skb);
++
++						NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++						if (ofo_queue->prev_queue) {
++								ofo_queue->prev_queue->next_queue = ofo_queue->next_queue;
++						} else {
++								napi->out_of_order_queue_list = ofo_queue->next_queue;
++						}
++
++						if (ofo_queue->next_queue) {
++								ofo_queue->next_queue->prev_queue = ofo_queue->prev_queue;
++						} else {
++								napi->out_of_order_queue_last = ofo_queue->prev_queue;
++						}
++
++						if (!ofo_queue->hash) {
++								ofo_queue->seq_next = NAPI_GRO_CB(skb)->seq;
++						}
++
++						// save this ns timestamp because we are putting the queue back immediately
++						ofo_queue->timestamp = ktime_to_ns(ktime_get());
++						ofo_queue->hash = NAPI_GRO_CB(skb)->tcp_hash;
++						ofo_queue->prev_queue = NULL;
++						ofo_queue->next_queue = napi->out_of_order_queue_list;
++						if (napi->out_of_order_queue_list) {
++							napi->out_of_order_queue_list->prev_queue = ofo_queue;
++						} else {
++							// out_of_order_queue_list and out_of_order_queue_last must be NULL at the same time
++							napi->out_of_order_queue_last = ofo_queue;
++						}
+ 
+-		*pp = nskb->next;
+-		nskb->next = NULL;
 -		napi_gro_complete(nskb);
-+		printk(KERN_NOTICE "dev_gro_receive qlen %u skb %u\n", NAPI_GRO_CB(nskb)->out_of_order_queue->qlen, NAPI_GRO_CB(nskb)->out_of_order_queue->skb_num);
-+		dev_gro_complete(napi, nskb, 0);
- 		napi->gro_count--;
- 	}
+-		napi->gro_count--;
+-	}
++						napi->out_of_order_queue_list = ofo_queue;
++				}
++				goto normal;
++		}
  
 -	if (same_flow)
 -		goto ok;
-+	if (same_flow) {
-+		if (NAPI_GRO_CB(skb)->free)
-+			goto ok;
-+		else
-+			goto pull;
-+	}
-+
-+	if (NAPI_GRO_CB(skb)->flush) {
-+		if (NAPI_GRO_CB(skb)->is_tcp && !NAPI_GRO_CB(skb)->out_of_order_queue) {
-+			ofo_queue = napi_get_tcp_ofo_queue(napi, skb);
++		NAPI_GRO_CB(skb)->count = 1;
++		//NAPI_GRO_CB(skb)->age = jiffies;
++		//NAPI_GRO_CB(skb)->timestamp = ktime_to_ns(ktime_get());
++		//NAPI_GRO_CB(skb)->last = skb;
++		if (NAPI_GRO_CB(skb)->is_tcp) {
  
 -	if (NAPI_GRO_CB(skb)->flush)
-+			//if (!ofo_queue) {
-+			//	goto normal;
-+			//}
-+
-+			NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
-+			if (ofo_queue->prev_queue) {
-+				ofo_queue->prev_queue->next_queue = ofo_queue->next_queue;
-+			} else {
-+				napi->out_of_order_queue_list = ofo_queue->next_queue;
-+			}	
-+
-+			if (ofo_queue->next_queue) {
-+				ofo_queue->next_queue->prev_queue = ofo_queue->prev_queue;
-+			}
-+
-+			if (!ofo_queue->age) {
-+				ofo_queue->seq_next = NAPI_GRO_CB(skb)->seq;
-+			}
-+
-+			ofo_queue->age = jiffies;
-+			ofo_queue->hash = NAPI_GRO_CB(skb)->tcp_hash;
-+			ofo_queue->prev_queue = NULL;
-+			ofo_queue->next_queue = napi->out_of_order_queue_list;
-+			if (napi->out_of_order_queue_list) {
-+				napi->out_of_order_queue_list->prev_queue = ofo_queue;
-+			}
-+
-+			napi->out_of_order_queue_list = ofo_queue;
-+		}
- 		goto normal;
-+	}
-+
-+	NAPI_GRO_CB(skb)->count = 1;
-+	NAPI_GRO_CB(skb)->age = jiffies;
-+	NAPI_GRO_CB(skb)->timestamp = ktime_to_ns(ktime_get());
-+	//NAPI_GRO_CB(skb)->last = skb;
-+	if (NAPI_GRO_CB(skb)->is_tcp) {
-+
-+		ofo_queue = napi_get_tcp_ofo_queue(napi, skb);
-+
-+		//if (!ofo_queue) {
-+		//	goto normal;
-+		//}
-+
-+		NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
-+		if (ofo_queue->prev_queue) {
-+			ofo_queue->prev_queue->next_queue = ofo_queue->next_queue;
-+		} else {
-+			napi->out_of_order_queue_list = ofo_queue->next_queue;
-+		}
-+
-+		if (ofo_queue->next_queue) {
-+			ofo_queue->next_queue->prev_queue = ofo_queue->prev_queue;
-+		}
-+
-+		if (!ofo_queue->age) {
-+			ofo_queue->seq_next = NAPI_GRO_CB(skb)->seq;
-+		}
-+
-+		if (before(NAPI_GRO_CB(skb)->seq, ofo_queue->seq_next)) {
-+			ofo_queue->age = jiffies;
-+			ofo_queue->prev_queue = NULL;
-+			ofo_queue->next_queue = napi->out_of_order_queue_list;
-+			if (napi->out_of_order_queue_list) {
-+				napi->out_of_order_queue_list->prev_queue = ofo_queue;
-+			}
-+			napi->out_of_order_queue_list = ofo_queue;
-+			printk(KERN_NOTICE "flush point 10: %u %u\n", NAPI_GRO_CB(skb)->seq, ofo_queue->seq_next);
-+			goto normal;
-+		}
-+
-+		ofo_queue->next = skb;
-+		ofo_queue->prev = skb;
-+		ofo_queue->qlen = skb_gro_len(skb);
-+		ofo_queue->skb_num = 1;
-+		ofo_queue->hash = NAPI_GRO_CB(skb)->tcp_hash;
-+	} else {
-+		NAPI_GRO_CB(skb)->out_of_order_queue = NULL;
-+	}
-+	NAPI_GRO_CB(skb)->prev = NULL;
-+	NAPI_GRO_CB(skb)->next = NULL;
-+	skb_shinfo(skb)->gso_size = skb_gro_len(skb);
-+	skb->next = napi->gro_list;
-+	napi->gro_list = skb;
+-		goto normal;
++				ofo_queue = napi_get_tcp_ofo_queue(napi, skb);
  
- 	if (unlikely(napi->gro_count >= MAX_GRO_SKBS)) {
- 		struct sk_buff *nskb = napi->gro_list;
-@@ -4075,16 +4329,11 @@
+-	if (unlikely(napi->gro_count >= MAX_GRO_SKBS)) {
+-		struct sk_buff *nskb = napi->gro_list;
++				//if (!ofo_queue) {
++				//	  goto normal;
++				//}
+ 
+-		/* locate the end of the list to select the 'oldest' flow */
+-		while (nskb->next) {
+-			pp = &nskb->next;
+-			nskb = *pp;
++				NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++				if (ofo_queue->prev_queue) {
++					ofo_queue->prev_queue->next_queue = ofo_queue->next_queue;
++				} else {
++					napi->out_of_order_queue_list = ofo_queue->next_queue;
++				}
++
++				if (ofo_queue->next_queue) {
++					ofo_queue->next_queue->prev_queue = ofo_queue->prev_queue;
++				} else {
++					napi->out_of_order_queue_last = ofo_queue->prev_queue;
++				}
++
++				if (!ofo_queue->hash) {
++					ofo_queue->seq_next = NAPI_GRO_CB(skb)->seq;
++					ofo_queue->flushed = false;
++				}
++
++				if (before(NAPI_GRO_CB(skb)->seq, ofo_queue->seq_next)) {
++
++						// save the ns timestamp because we are putting the queue back
++						ofo_queue->timestamp = ktime_to_ns(ktime_get());
++						ofo_queue->prev_queue = NULL;
++						ofo_queue->next_queue = napi->out_of_order_queue_list;
++						if (napi->out_of_order_queue_list) {
++								napi->out_of_order_queue_list->prev_queue = ofo_queue;
++						} else {
++							napi->out_of_order_queue_last = ofo_queue;
++						}
++						napi->out_of_order_queue_list = ofo_queue;
++						printk(KERN_NOTICE "flush point 10: %u %u\n", NAPI_GRO_CB(skb)->seq, ofo_queue->seq_next);
++						goto normal;
++				}
++
++				ofo_queue->next = skb;
++				ofo_queue->prev = skb;
++				ofo_queue->qlen = skb_gro_len(skb);
++				ofo_queue->skb_num = 1;
++				ofo_queue->timestamp = ktime_to_ns(ktime_get());
++				ofo_queue->hash = NAPI_GRO_CB(skb)->tcp_hash;
++		} else {
++				NAPI_GRO_CB(skb)->out_of_order_queue = NULL;
++		}
++		NAPI_GRO_CB(skb)->prev = NULL;
++		NAPI_GRO_CB(skb)->next = NULL;
++		skb_shinfo(skb)->gso_size = skb_gro_len(skb);
++		skb->next = napi->gro_list;
++		napi->gro_list = skb;
++
++		if (unlikely(napi->gro_count >= MAX_GRO_SKBS)) {
++				struct sk_buff *nskb = napi->gro_list;
++
++				/* locate the end of the list to select the 'oldest' flow */
++				while (nskb->next) {
++						pp = &nskb->next;
++						nskb = *pp;
++				}
++				*pp = NULL;
++				nskb->next = NULL;
++				printk(KERN_INFO "gro overflow\n");
++				dev_gro_complete(napi, nskb, false);
++		} else {
++				napi->gro_count++;
  		}
- 		*pp = NULL;
- 		nskb->next = NULL;
+-		*pp = NULL;
+-		nskb->next = NULL;
 -		napi_gro_complete(nskb);
-+		dev_gro_complete(napi, nskb, 0);
- 	} else {
- 		napi->gro_count++;
- 	}
+-	} else {
+-		napi->gro_count++;
+-	}
 -	NAPI_GRO_CB(skb)->count = 1;
 -	NAPI_GRO_CB(skb)->age = jiffies;
 -	NAPI_GRO_CB(skb)->last = skb;
 -	skb_shinfo(skb)->gso_size = skb_gro_len(skb);
 -	skb->next = napi->gro_list;
 -	napi->gro_list = skb;
+-	ret = GRO_HELD;
 +
- 	ret = GRO_HELD;
++		ret = GRO_HELD;
  
  pull:
-@@ -4095,6 +4344,11 @@
- 	return ret;
+-	grow = skb_gro_offset(skb) - skb_headlen(skb);
+-	if (grow > 0)
+-		gro_pull_from_frag0(skb, grow);
++		grow = skb_gro_offset(skb) - skb_headlen(skb);
++		if (grow > 0)
++				gro_pull_from_frag0(skb, grow);
+ ok:
+-	return ret;
++		return ret;
  
  normal:
-+	ofo_queue = NAPI_GRO_CB(skb)->out_of_order_queue;
-+	if (ofo_queue) {
-+		ofo_queue->seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(skb)->seq + NAPI_GRO_CB(skb)->len);
-+	}
-+	printk(KERN_NOTICE "normal qlen %u skb %u\n", NAPI_GRO_CB(skb)->len, 1);
- 	ret = GRO_NORMAL;
- 	goto pull;
+-	ret = GRO_NORMAL;
+-	goto pull;
++		ofo_queue = NAPI_GRO_CB(skb)->out_of_order_queue;
++		if (ofo_queue) {
++			seq_next = max_seq(ofo_queue->seq_next, NAPI_GRO_CB(skb)->seq + NAPI_GRO_CB(skb)->len);
++			if (ofo_queue->seq_next != seq_next) {
++				ofo_queue->seq_next = seq_next;
++				ofo_queue->timestamp = ktime_to_ns(ktime_get());
++				ofo_queue->flushed = true;
++			}
++		}
++		printk(KERN_NOTICE "normal qlen %u skb %u\n", NAPI_GRO_CB(skb)->len, 1);
++		ret = GRO_NORMAL;
++		goto pull;
  }
-@@ -4178,6 +4432,7 @@
+ 
++
++
+ struct packet_offload *gro_find_receive_by_type(__be16 type)
+ {
+ 	struct list_head *offload_head = &offload_base;
+@@ -4217,6 +4486,7 @@
  	skb->skb_iif = 0;
  	skb->encapsulation = 0;
  	skb_shinfo(skb)->gso_type = 0;
@@ -505,108 +1611,125 @@ diff -Naur linux-3.18.5/net/core/dev.c linux-3.18.5-juggler/net/core/dev.c
  	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
  
  	napi->skb = skb;
-@@ -4400,7 +4655,7 @@
- void __napi_complete(struct napi_struct *n)
+@@ -4235,8 +4505,8 @@
+ EXPORT_SYMBOL(napi_get_frags);
+ 
+ static gro_result_t napi_frags_finish(struct napi_struct *napi,
+-				      struct sk_buff *skb,
+-				      gro_result_t ret)
++					  struct sk_buff *skb,
++					  gro_result_t ret)
  {
- 	BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
--	BUG_ON(n->gro_list);
-+	//BUG_ON(n->gro_list);
+ 	switch (ret) {
+ 	case GRO_NORMAL:
+@@ -4325,7 +4595,7 @@
+ 	sum = csum_fold(csum_add(NAPI_GRO_CB(skb)->csum, wsum));
+ 	if (likely(!sum)) {
+ 		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
+-		    !skb->csum_complete_sw)
++			!skb->csum_complete_sw)
+ 			netdev_rx_csum_fault(skb->dev);
+ 	}
  
- 	list_del(&n->poll_list);
- 	smp_mb__before_atomic();
-@@ -4478,12 +4733,91 @@
+@@ -4392,10 +4662,8 @@
+ 		struct sk_buff *skb;
+ 
+ 		while ((skb = __skb_dequeue(&sd->process_queue))) {
+-			rcu_read_lock();
+ 			local_irq_enable();
+ 			__netif_receive_skb(skb);
+-			rcu_read_unlock();
+ 			local_irq_disable();
+ 			input_queue_head_incr(sd);
+ 			if (++work >= quota) {
+@@ -4479,18 +4747,24 @@
+ 	if (unlikely(test_bit(NAPI_STATE_NPSVC, &n->state)))
+ 		return;
+ 
+-	if (n->gro_list) {
+-		unsigned long timeout = 0;
+-
+-		if (work_done)
+-			timeout = n->dev->gro_flush_timeout;
++	if (unlikely(napi_disable_pending(n))) {
++		printk(KERN_INFO "napi_complete_done 1\n");
++		napi_gro_flush(n, false);
++	}
+ 
+-		if (timeout)
+-			hrtimer_start(&n->timer, ns_to_ktime(timeout),
+-				      HRTIMER_MODE_REL_PINNED);
+-		else
+-			napi_gro_flush(n, false);
++	if (n->dev->gro_flush_timeout) {
++		printk(KERN_INFO "napi_complete_done 2\n");
++		napi_gro_flush(n, true);
++		if (n->gro_list) {
++			printk(KERN_INFO "start timer\n");
++			hrtimer_start(&n->timer, ns_to_ktime(n->dev->gro_flush_timeout),
++				HRTIMER_MODE_REL_PINNED);
++		}
++	} else {
++		printk(KERN_INFO "napi_complete_done 3\n");
++		napi_gro_flush(n, false);
+ 	}
++
+ 	if (likely(list_empty(&n->poll_list))) {
+ 		WARN_ON_ONCE(!test_and_clear_bit(NAPI_STATE_SCHED, &n->state));
+ 	} else {
+@@ -4562,22 +4836,49 @@
+ 	if (napi->gro_list)
+ 		napi_schedule(napi);
+ 
++	printk(KERN_INFO "timer expires\n");
+ 	return HRTIMER_NORESTART;
  }
- EXPORT_SYMBOL_GPL(napi_hash_del);
  
-+static void napi_flush_watchdog_tasklet(unsigned long _napi) {
-+
-+	struct napi_struct *napi = (struct napi_struct*)_napi;
-+	struct sk_buff *skb, *prev = NULL;
-+
-+	//printk(KERN_NOTICE "before lock 1\n");
-+	if (!spin_trylock(&napi->gro_lock)) {
-+		return;
-+	}
-+	//printk(KERN_NOTICE "after lock 1\n");
-+	/*
-+	for (skb = napi->gro_list; skb != NULL;skb = skb->next) {
-+		skb->prev = prev;
-+		prev = skb;
-+	}
-+
-+	for (skb = prev; skb; skb = prev) {
-+		prev = skb->prev;
-+		skb->prev = NULL;
-+		skb->next = NULL;
-+		printk(KERN_NOTICE "napi_flush_watchdog qlen %u skb %u\n", NAPI_GRO_CB(skb)->out_of_order_queue->qlen, NAPI_GRO_CB(skb)->out_of_order_queue->skb_num);
-+		dev_gro_complete(napi, skb, 0);
-+	}
-+
-+	napi->gro_count = 0;
-+	napi->gro_list = NULL;
-+	*/
-+	napi_gro_flush(napi, false);
-+	printk(KERN_NOTICE "napi_flush_timer\n");
-+
-+	//printk(KERN_NOTICE "before unlock 1\n");
-+	spin_unlock(&napi->gro_lock);
-+	//printk(KERN_NOTICE "after unlock 1\n");
-+
-+	return;
-+}
-+
-+static enum hrtimer_restart napi_flush_watchdog(struct hrtimer *timer)
-+{
-+	struct napi_struct *napi;
-+
-+	napi = container_of(timer, struct napi_struct, timer);
-+
-+	tasklet_hi_schedule(&napi->timer_timeout);
-+
-+	return HRTIMER_NORESTART;
-+}
-+
  void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
- 		    int (*poll)(struct napi_struct *, int), int weight)
+-		    int (*poll)(struct napi_struct *, int), int weight)
++	int (*poll)(struct napi_struct *, int), int weight)
  {
 +	int i;
 +	struct sk_buff_head_gro *ofo_queue;
 +
  	INIT_LIST_HEAD(&napi->poll_list);
-+
-+	hrtimer_init(&napi->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-+	napi->timer.function = napi_flush_watchdog;
-+	tasklet_init(&napi->timer_timeout, napi_flush_watchdog_tasklet, (unsigned long)napi);
-+	spin_lock_init(&napi->gro_lock);
-+
+ 	hrtimer_init(&napi->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+ 	napi->timer.function = napi_watchdog;
  	napi->gro_count = 0;
  	napi->gro_list = NULL;
 +	napi->out_of_order_queue_list = NULL;
 +
 +	for (i=0; i<=MAX_GRO_SKBS; i++) {
 +		ofo_queue = (struct sk_buff_head_gro*)kmalloc(sizeof(struct sk_buff_head_gro), GFP_ATOMIC);
-+
++		if (i == 0) {
++			napi->out_of_order_queue_last = ofo_queue;
++		}
 +		ofo_queue->next = NULL;
 +		ofo_queue->prev = NULL;
 +		ofo_queue->next_queue = napi->out_of_order_queue_list;
 +		ofo_queue->prev_queue = NULL;
-+		ofo_queue->age = 0;
++		ofo_queue->timestamp = 0;
++		ofo_queue->ofo_timeout = 1e5;
 +		ofo_queue->hash = 0;
 +		ofo_queue->qlen = 0;
 +		ofo_queue->skb_num = 0;
 +		ofo_queue->seq_next = 0;
-+
 +		if (napi->out_of_order_queue_list) {
-+			napi->out_of_order_queue_list->prev_queue = ofo_queue;
++				napi->out_of_order_queue_list->prev_queue = ofo_queue;
 +		}
-+
 +		napi->out_of_order_queue_list = ofo_queue;
 +	}
 +
  	napi->skb = NULL;
  	napi->poll = poll;
  	if (weight > NAPI_POLL_WEIGHT)
-@@ -4502,10 +4836,45 @@
+ 		pr_err_once("netif_napi_add() called with weight %d on device %s\n",
+-			    weight, dev->name);
++				weight, dev->name);
+ 	napi->weight = weight;
+ 	list_add(&napi->dev_list, &dev->napi_list);
+ 	napi->dev = dev;
+@@ -4605,12 +4906,39 @@
  
  void netif_napi_del(struct napi_struct *napi)
  {
@@ -614,23 +1737,16 @@ diff -Naur linux-3.18.5/net/core/dev.c linux-3.18.5-juggler/net/core/dev.c
 +	struct sk_buff *skb, *skb2, *skb3, *skb4;
 +
  	list_del_init(&napi->dev_list);
-+
-+	hrtimer_cancel(&napi->timer);
-+
-+	tasklet_kill(&napi->timer_timeout);
-+
  	napi_free_frags(napi);
  
 -	kfree_skb_list(napi->gro_list);
-+	//kfree_skb_list(napi->gro_list);
-+
 +	skb = napi->gro_list;
 +	while (skb) {
 +		skb2 = skb->next;
 +		ofo_queue = NAPI_GRO_CB(skb)->out_of_order_queue;
 +		if (ofo_queue) {
 +			skb3 = ofo_queue->next;
-+			while (skb3) {
++			while (skb3) { 
 +				skb4 = NAPI_GRO_CB(skb3)->next;
 +				kfree_skb(skb3);
 +				skb3 = skb4;
@@ -641,6 +1757,8 @@ diff -Naur linux-3.18.5/net/core/dev.c linux-3.18.5-juggler/net/core/dev.c
 +		}
 +		skb = skb2;
 +	}
+ 	napi->gro_list = NULL;
+ 	napi->gro_count = 0;
 +
 +	ofo_queue = napi->out_of_order_queue_list;
 +	while (ofo_queue) {
@@ -648,229 +1766,695 @@ diff -Naur linux-3.18.5/net/core/dev.c linux-3.18.5-juggler/net/core/dev.c
 +		kfree(ofo_queue);
 +		ofo_queue = ofo_queue2;
 +	}
-+
 +	napi->out_of_order_queue_list = NULL;
- 	napi->gro_list = NULL;
- 	napi->gro_count = 0;
  }
-@@ -4517,6 +4886,7 @@
- 	unsigned long time_limit = jiffies + 2;
- 	int budget = netdev_budget;
- 	void *have;
-+	//unsigned long flags;
+ EXPORT_SYMBOL(netif_napi_del);
  
- 	local_irq_disable();
+@@ -4623,6 +4951,8 @@
  
-@@ -4540,8 +4910,15 @@
+ 	have = netpoll_poll_lock(n);
+ 
++	napi_clean_tcp_ofo_queue(n);
++
+ 	weight = n->weight;
+ 
+ 	/* This NAPI_STATE_SCHED test is for avoiding a race
+@@ -4656,7 +4986,8 @@
+ 		/* flush too old packets
+ 		 * If HZ < 1000, flush all packets.
  		 */
- 		n = list_first_entry(&sd->poll_list, struct napi_struct, poll_list);
+-		napi_gro_flush(n, HZ >= 1000);
++		printk(KERN_INFO "napi_poll\n");
++		napi_gro_flush(n, true);
+ 	}
  
-+		//hrtimer_cancel(&n->timer);
-+
- 		have = netpoll_poll_lock(n);
+ 	/* Some drivers may have called napi_schedule
+@@ -4664,7 +4995,7 @@
+ 	 */
+ 	if (unlikely(!list_empty(&n->poll_list))) {
+ 		pr_warn_once("%s: Budget exhausted after napi rescheduled\n",
+-			     n->dev ? n->dev->name : "backlog");
++				 n->dev ? n->dev->name : "backlog");
+ 		goto out_unlock;
+ 	}
  
-+		//printk(KERN_NOTICE "before lock 2\n");
-+		spin_lock(&n->gro_lock);
-+		napi_clean_tcp_ofo_queue(n);
-+		//printk(KERN_NOTICE "after lock 2\n");
-+		//n->timestamp = ktime_get();
- 		weight = n->weight;
+@@ -4688,6 +5019,8 @@
+ 	list_splice_init(&sd->poll_list, &list);
+ 	local_irq_enable();
  
- 		/* This NAPI_STATE_SCHED test is for avoiding a race
-@@ -4560,6 +4937,10 @@
++	printk(KERN_INFO "enter soft irq\n");
++
+ 	for (;;) {
+ 		struct napi_struct *n;
  
- 		budget -= work;
+@@ -4705,7 +5038,7 @@
+ 		 * an average latency of 1.5/HZ.
+ 		 */
+ 		if (unlikely(budget <= 0 ||
+-			     time_after_eq(jiffies, time_limit))) {
++				 time_after_eq(jiffies, time_limit))) {
+ 			sd->time_squeeze++;
+ 			break;
+ 		}
+@@ -4852,7 +5185,7 @@
+  * position. The caller must hold RCU read lock.
+  */
+ struct net_device *netdev_all_upper_get_next_dev_rcu(struct net_device *dev,
+-						     struct list_head **iter)
++							 struct list_head **iter)
+ {
+ 	struct netdev_adjacent *upper;
  
-+		//printk(KERN_NOTICE "before unlock 2\n");
-+		//spin_unlock(&n->gro_lock);
-+		//printk(KERN_NOTICE "after unlock 2\n");
-+
- 		local_irq_disable();
+@@ -4881,7 +5214,7 @@
+  * list will remain unchainged.
+  */
+ void *netdev_lower_get_next_private(struct net_device *dev,
+-				    struct list_head **iter)
++					struct list_head **iter)
+ {
+ 	struct netdev_adjacent *lower;
  
- 		/* Drivers must not modify the NAPI state if they
-@@ -4570,7 +4951,17 @@
- 		if (unlikely(work == weight)) {
- 			if (unlikely(napi_disable_pending(n))) {
- 				local_irq_enable();
-+
-+				//printk(KERN_NOTICE "before lock 3\n");
-+				//spin_lock(&n->gro_lock);
-+				//printk(KERN_NOTICE "after lock 3\n");
-+
- 				napi_complete(n);
-+
-+				//printk(KERN_NOTICE "before unlock 3\n");
-+				//spin_unlock(&n->gro_lock);
-+				//printk(KERN_NOTICE "after unlock 3\n");
-+
- 				local_irq_disable();
- 			} else {
- 				if (n->gro_list) {
-@@ -4578,13 +4969,24 @@
- 					 * If HZ < 1000, flush all packets.
- 					 */
- 					local_irq_enable();
-+
-+					//printk(KERN_NOTICE "before lock 4\n");
-+					//spin_lock(&n->gro_lock);
-+					//printk(KERN_NOTICE "after lock 4\n");
-+
- 					napi_gro_flush(n, HZ >= 1000);
-+
-+					//printk(KERN_NOTICE "before unlock 4\n");
-+					//spin_unlock(&n->gro_lock);
-+					//printk(KERN_NOTICE "after unlock 4\n");
-+
- 					local_irq_disable();
- 				}
- 				list_move_tail(&n->poll_list, &sd->poll_list);
- 			}
+@@ -4898,8 +5231,8 @@
+ 
+ /**
+  * netdev_lower_get_next_private_rcu - Get the next ->private from the
+- *				       lower neighbour list, RCU
+- *				       variant
++ *					   lower neighbour list, RCU
++ *					   variant
+  * @dev: device
+  * @iter: list_head ** of the current position
+  *
+@@ -4926,7 +5259,7 @@
+ 
+ /**
+  * netdev_lower_get_next - Get the next device from the lower neighbour
+- *                         list
++ *						 list
+  * @dev: device
+  * @iter: list_head ** of the current position
+  *
+@@ -4952,8 +5285,8 @@
+ 
+ /**
+  * netdev_lower_get_first_private_rcu - Get the first ->private from the
+- *				       lower neighbour list, RCU
+- *				       variant
++ *					   lower neighbour list, RCU
++ *					   variant
+  * @dev: device
+  *
+  * Gets the first netdev_adjacent->private from the dev's lower neighbour
+@@ -4983,7 +5316,7 @@
+ 	struct netdev_adjacent *upper;
+ 
+ 	upper = list_first_or_null_rcu(&dev->adj_list.upper,
+-				       struct netdev_adjacent, list);
++					   struct netdev_adjacent, list);
+ 	if (upper && likely(upper->master))
+ 		return upper->dev;
+ 	return NULL;
+@@ -4991,8 +5324,8 @@
+ EXPORT_SYMBOL(netdev_master_upper_dev_get_rcu);
+ 
+ static int netdev_adjacent_sysfs_add(struct net_device *dev,
+-			      struct net_device *adj_dev,
+-			      struct list_head *dev_list)
++				  struct net_device *adj_dev,
++				  struct list_head *dev_list)
+ {
+ 	char linkname[IFNAMSIZ+7];
+ 	sprintf(linkname, dev_list == &dev->adj_list.upper ?
+@@ -5001,8 +5334,8 @@
+ 				 linkname);
+ }
+ static void netdev_adjacent_sysfs_del(struct net_device *dev,
+-			       char *name,
+-			       struct list_head *dev_list)
++				   char *name,
++				   struct list_head *dev_list)
+ {
+ 	char linkname[IFNAMSIZ+7];
+ 	sprintf(linkname, dev_list == &dev->adj_list.upper ?
+@@ -5087,7 +5420,7 @@
+ 
+ 	if (!adj) {
+ 		pr_err("tried to remove device %s from %s\n",
+-		       dev->name, adj_dev->name);
++			   dev->name, adj_dev->name);
+ 		BUG();
+ 	}
+ 
+@@ -5112,10 +5445,10 @@
+ }
+ 
+ static int __netdev_adjacent_dev_link_lists(struct net_device *dev,
+-					    struct net_device *upper_dev,
+-					    struct list_head *up_list,
+-					    struct list_head *down_list,
+-					    void *private, bool master)
++						struct net_device *upper_dev,
++						struct list_head *up_list,
++						struct list_head *down_list,
++						void *private, bool master)
+ {
+ 	int ret;
+ 
+@@ -5135,7 +5468,7 @@
+ }
+ 
+ static int __netdev_adjacent_dev_link(struct net_device *dev,
+-				      struct net_device *upper_dev)
++					  struct net_device *upper_dev)
+ {
+ 	return __netdev_adjacent_dev_link_lists(dev, upper_dev,
+ 						&dev->all_adj_list.upper,
+@@ -5144,9 +5477,9 @@
+ }
+ 
+ static void __netdev_adjacent_dev_unlink_lists(struct net_device *dev,
+-					       struct net_device *upper_dev,
+-					       struct list_head *up_list,
+-					       struct list_head *down_list)
++						   struct net_device *upper_dev,
++						   struct list_head *up_list,
++						   struct list_head *down_list)
+ {
+ 	__netdev_adjacent_dev_remove(dev, upper_dev, up_list);
+ 	__netdev_adjacent_dev_remove(upper_dev, dev, down_list);
+@@ -5170,9 +5503,9 @@
+ 		return ret;
+ 
+ 	ret = __netdev_adjacent_dev_link_lists(dev, upper_dev,
+-					       &dev->adj_list.upper,
+-					       &upper_dev->adj_list.lower,
+-					       private, master);
++						   &dev->adj_list.upper,
++						   &upper_dev->adj_list.lower,
++						   private, master);
+ 	if (ret) {
+ 		__netdev_adjacent_dev_unlink(dev, upper_dev);
+ 		return ret;
+@@ -5343,7 +5676,7 @@
+  * the RTNL lock.
+  */
+ void netdev_upper_dev_unlink(struct net_device *dev,
+-			     struct net_device *upper_dev)
++				 struct net_device *upper_dev)
+ {
+ 	struct netdev_adjacent *i, *j;
+ 	ASSERT_RTNL();
+@@ -5385,9 +5718,9 @@
+ 	struct netdev_notifier_bonding_info	info;
+ 
+ 	memcpy(&info.bonding_info, bonding_info,
+-	       sizeof(struct netdev_bonding_info));
++		   sizeof(struct netdev_bonding_info));
+ 	call_netdevice_notifiers_info(NETDEV_BONDING_INFO, dev,
+-				      &info.info);
++					  &info.info);
+ }
+ EXPORT_SYMBOL(netdev_bonding_info_change);
+ 
+@@ -5483,7 +5816,7 @@
+ 
+ 
+ int dev_get_nest_level(struct net_device *dev,
+-		       bool (*type_check)(struct net_device *dev))
++			   bool (*type_check)(struct net_device *dev))
+ {
+ 	struct net_device *lower = NULL;
+ 	struct list_head *iter;
+@@ -5721,10 +6054,10 @@
+ 	 */
+ 
+ 	dev->flags = (flags & (IFF_DEBUG | IFF_NOTRAILERS | IFF_NOARP |
+-			       IFF_DYNAMIC | IFF_MULTICAST | IFF_PORTSEL |
+-			       IFF_AUTOMEDIA)) |
+-		     (dev->flags & (IFF_UP | IFF_VOLATILE | IFF_PROMISC |
+-				    IFF_ALLMULTI));
++				   IFF_DYNAMIC | IFF_MULTICAST | IFF_PORTSEL |
++				   IFF_AUTOMEDIA)) |
++			 (dev->flags & (IFF_UP | IFF_VOLATILE | IFF_PROMISC |
++					IFF_ALLMULTI));
+ 
+ 	/*
+ 	 *	Load in the correct multicast list now the flags have changed.
+@@ -5786,12 +6119,12 @@
+ 	}
+ 
+ 	if (dev->flags & IFF_UP &&
+-	    (changes & ~(IFF_UP | IFF_PROMISC | IFF_ALLMULTI | IFF_VOLATILE))) {
++		(changes & ~(IFF_UP | IFF_PROMISC | IFF_ALLMULTI | IFF_VOLATILE))) {
+ 		struct netdev_notifier_change_info change_info;
+ 
+ 		change_info.flags_changed = changes;
+ 		call_netdevice_notifiers_info(NETDEV_CHANGE, dev,
+-					      &change_info.info);
++						  &change_info.info);
+ 	}
+ }
+ 
+@@ -6031,7 +6364,6 @@
+ 		unlist_netdevice(dev);
+ 
+ 		dev->reg_state = NETREG_UNREGISTERING;
+-		on_each_cpu(flush_backlog, dev, 1);
+ 	}
+ 
+ 	synchronize_net();
+@@ -6049,9 +6381,9 @@
+ 		call_netdevice_notifiers(NETDEV_UNREGISTER, dev);
+ 
+ 		if (!dev->rtnl_link_ops ||
+-		    dev->rtnl_link_state == RTNL_LINK_INITIALIZED)
++			dev->rtnl_link_state == RTNL_LINK_INITIALIZED)
+ 			skb = rtmsg_ifinfo_build_skb(RTM_DELLINK, dev, ~0U,
+-						     GFP_KERNEL);
++							 GFP_KERNEL);
+ 
+ 		/*
+ 		 *	Flush the unicast and multicast chains
+@@ -6096,7 +6428,7 @@
+ {
+ 	/* Fix illegal checksum combinations */
+ 	if ((features & NETIF_F_HW_CSUM) &&
+-	    (features & (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))) {
++		(features & (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))) {
+ 		netdev_warn(dev, "mixed HW and IP checksum settings.\n");
+ 		features &= ~(NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM);
+ 	}
+@@ -6134,8 +6466,8 @@
+ 	if (features & NETIF_F_UFO) {
+ 		/* maybe split UFO into V4 and V6? */
+ 		if (!((features & NETIF_F_GEN_CSUM) ||
+-		    (features & (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))
+-			    == (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))) {
++			(features & (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))
++				== (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))) {
+ 			netdev_dbg(dev,
+ 				"Dropping NETIF_F_UFO since no checksum offload features.\n");
+ 			features &= ~NETIF_F_UFO;
+@@ -6302,8 +6634,7 @@
+ 	struct netdev_queue *tx;
+ 	size_t sz = count * sizeof(*tx);
+ 
+-	if (count < 1 || count > 0xffff)
+-		return -EINVAL;
++	BUG_ON(count < 1 || count > 0xffff);
+ 
+ 	tx = kzalloc(sz, GFP_KERNEL | __GFP_NOWARN | __GFP_REPEAT);
+ 	if (!tx) {
+@@ -6368,9 +6699,9 @@
+ 	}
+ 
+ 	if (((dev->hw_features | dev->features) &
+-	     NETIF_F_HW_VLAN_CTAG_FILTER) &&
+-	    (!dev->netdev_ops->ndo_vlan_rx_add_vid ||
+-	     !dev->netdev_ops->ndo_vlan_rx_kill_vid)) {
++		 NETIF_F_HW_VLAN_CTAG_FILTER) &&
++		(!dev->netdev_ops->ndo_vlan_rx_add_vid ||
++		 !dev->netdev_ops->ndo_vlan_rx_kill_vid)) {
+ 		netdev_WARN(dev, "Buggy VLAN acceleration in driver!\n");
+ 		ret = -EINVAL;
+ 		goto err_uninit;
+@@ -6450,7 +6781,7 @@
+ 	 *	device is fully setup before sending notifications.
+ 	 */
+ 	if (!dev->rtnl_link_ops ||
+-	    dev->rtnl_link_state == RTNL_LINK_INITIALIZED)
++		dev->rtnl_link_state == RTNL_LINK_INITIALIZED)
+ 		rtmsg_ifinfo(RTM_NEWLINK, dev, ~0U, GFP_KERNEL);
+ 
+ out:
+@@ -6573,7 +6904,7 @@
+ 
+ 			call_netdevice_notifiers(NETDEV_UNREGISTER_FINAL, dev);
+ 			if (test_bit(__LINK_STATE_LINKWATCH_PENDING,
+-				     &dev->state)) {
++					 &dev->state)) {
+ 				/* We must not have linkwatch events
+ 				 * pending on unregister. If this
+ 				 * happens, we simply run the queue
+@@ -6609,7 +6940,7 @@
+  *	...
+  *	unregister_netdevice(y1);
+  *	unregister_netdevice(y2);
+- *      ...
++ *	  ...
+  *	rtnl_unlock();
+  *	free_netdev(y1);
+  *	free_netdev(y2);
+@@ -6617,9 +6948,9 @@
+  * We are invoked by rtnl_unlock().
+  * This allows us to deal with problems:
+  * 1) We can delete sysfs objects which invoke hotplug
+- *    without deadlocking with linkwatch via keventd.
++ *	without deadlocking with linkwatch via keventd.
+  * 2) Since we run with the RTNL semaphore not held, we can sleep
+- *    safely in order to wait for the netdev refcnt to drop to zero.
++ *	safely in order to wait for the netdev refcnt to drop to zero.
+  *
+  * We must not return until all unregister events added during
+  * the interval the lock was held have been completed.
+@@ -6649,13 +6980,15 @@
+ 
+ 		if (unlikely(dev->reg_state != NETREG_UNREGISTERING)) {
+ 			pr_err("network todo '%s' but state %d\n",
+-			       dev->name, dev->reg_state);
++				   dev->name, dev->reg_state);
+ 			dump_stack();
+ 			continue;
  		}
  
-+		spin_unlock(&n->gro_lock);
- 		netpoll_poll_unlock(have);
+ 		dev->reg_state = NETREG_UNREGISTERED;
+ 
++		on_each_cpu(flush_backlog, dev, 1);
++
+ 		netdev_wait_allrefs(dev);
+ 
+ 		/* paranoia */
+@@ -6684,7 +7017,7 @@
+  * fields in the same order, with only the type differing.
+  */
+ void netdev_stats_to_stats64(struct rtnl_link_stats64 *stats64,
+-			     const struct net_device_stats *netdev_stats)
++				 const struct net_device_stats *netdev_stats)
+ {
+ #if BITS_PER_LONG == 64
+ 	BUILD_BUG_ON(sizeof(*stats64) != sizeof(*netdev_stats));
+@@ -6695,7 +7028,7 @@
+ 	u64 *dst = (u64 *)stats64;
+ 
+ 	BUILD_BUG_ON(sizeof(*netdev_stats) / sizeof(unsigned long) !=
+-		     sizeof(*stats64) / sizeof(u64));
++			 sizeof(*stats64) / sizeof(u64));
+ 	for (i = 0; i < n; i++)
+ 		dst[i] = src[i];
+ #endif
+@@ -6752,7 +7085,7 @@
+ static const struct ethtool_ops default_ethtool_ops;
+ 
+ void netdev_set_default_ethtool_ops(struct net_device *dev,
+-				    const struct ethtool_ops *ops)
++					const struct ethtool_ops *ops)
+ {
+ 	if (dev->ethtool_ops == &default_ethtool_ops)
+ 		dev->ethtool_ops = ops;
+@@ -7009,7 +7342,7 @@
+  *	@dev: device
+  *	@net: network namespace
+  *	@pat: If not NULL name pattern to try if the current device name
+- *	      is already taken in the destination network namespace.
++ *		  is already taken in the destination network namespace.
+  *
+  *	This function shuts down a device interface and moves it
+  *	to a new network namespace. On success 0 is returned, on
+@@ -7123,8 +7456,8 @@
+ EXPORT_SYMBOL_GPL(dev_change_net_namespace);
+ 
+ static int dev_cpu_callback(struct notifier_block *nfb,
+-			    unsigned long action,
+-			    void *ocpu)
++				unsigned long action,
++				void *ocpu)
+ {
+ 	struct sk_buff **list_skb;
+ 	struct sk_buff *skb;
+@@ -7160,8 +7493,8 @@
+ 	 */
+ 	while (!list_empty(&oldsd->poll_list)) {
+ 		struct napi_struct *napi = list_first_entry(&oldsd->poll_list,
+-							    struct napi_struct,
+-							    poll_list);
++								struct napi_struct,
++								poll_list);
+ 
+ 		list_del_init(&napi->poll_list);
+ 		if (napi->poll == process_backlog)
+@@ -7273,7 +7606,7 @@
+ }
+ 
+ static void __netdev_printk(const char *level, const struct net_device *dev,
+-			    struct va_format *vaf)
++				struct va_format *vaf)
+ {
+ 	if (dev && dev->dev.parent) {
+ 		dev_printk_emit(level[1] - '0',
+@@ -7285,7 +7618,7 @@
+ 				vaf);
+ 	} else if (dev) {
+ 		printk("%s%s%s: %pV",
+-		       level, netdev_name(dev), netdev_reg_state(dev), vaf);
++			   level, netdev_name(dev), netdev_reg_state(dev), vaf);
+ 	} else {
+ 		printk("%s(NULL net_device): %pV", level, vaf);
  	}
- out:
-diff -Naur linux-3.18.5/net/core/skbuff.c linux-3.18.5-juggler/net/core/skbuff.c
---- linux-3.18.5/net/core/skbuff.c	2015-01-30 09:41:03.000000000 +0800
-+++ linux-3.18.5-juggler/net/core/skbuff.c	2016-09-09 05:45:11.957822358 +0800
-@@ -3096,22 +3096,64 @@
+@@ -7452,8 +7785,8 @@
+  */
+ 
+ /*
+- *       This is called single threaded during boot, so no need
+- *       to take the rtnl semaphore.
++ *	   This is called single threaded during boot, so no need
++ *	   to take the rtnl semaphore.
+  */
+ static int __init net_dev_init(void)
+ {
+diff -Naur linux-4.1.32/net/core/net-sysfs.c linux-4.1.32-juggler/net/core/net-sysfs.c
+--- linux-4.1.32/net/core/net-sysfs.c	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/net/core/net-sysfs.c	2016-09-09 06:12:15.549823145 +0800
+@@ -352,6 +352,40 @@
+ }
+ NETDEVICE_SHOW_RW(gro_flush_timeout, fmt_ulong);
+ 
++static int change_gro_inseq_timeout(struct net_device *dev, unsigned long val)
++{
++	dev->gro_inseq_timeout = val;
++	return 0;
++}
++
++static ssize_t gro_inseq_timeout_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t len)
++{
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
++	return netdev_store(dev, attr, buf, len, change_gro_inseq_timeout);
++}
++NETDEVICE_SHOW_RW(gro_inseq_timeout, fmt_ulong);
++
++static int change_gro_ofo_timeout(struct net_device *dev, unsigned long val)
++{
++	dev->gro_ofo_timeout = val;
++	return 0;
++}
++
++static ssize_t gro_ofo_timeout_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t len)
++{
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
++	return netdev_store(dev, attr, buf, len, change_gro_ofo_timeout);
++}
++NETDEVICE_SHOW_RW(gro_ofo_timeout, fmt_ulong);
++
+ static ssize_t ifalias_store(struct device *dev, struct device_attribute *attr,
+ 			     const char *buf, size_t len)
+ {
+@@ -494,6 +528,8 @@
+ 	&dev_attr_flags.attr,
+ 	&dev_attr_tx_queue_len.attr,
+ 	&dev_attr_gro_flush_timeout.attr,
++	&dev_attr_gro_inseq_timeout.attr,
++	&dev_attr_gro_ofo_timeout.attr,
+ 	&dev_attr_phys_port_id.attr,
+ 	&dev_attr_phys_port_name.attr,
+ 	&dev_attr_phys_switch_id.attr,
+diff -Naur linux-4.1.32/net/core/skbuff.c linux-4.1.32-juggler/net/core/skbuff.c
+--- linux-4.1.32/net/core/skbuff.c	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/net/core/skbuff.c	2016-09-09 06:12:15.549823145 +0800
+@@ -79,8 +79,6 @@
+ 
+ struct kmem_cache *skbuff_head_cache __read_mostly;
+ static struct kmem_cache *skbuff_fclone_cache __read_mostly;
+-int sysctl_max_skb_frags __read_mostly = MAX_SKB_FRAGS;
+-EXPORT_SYMBOL(sysctl_max_skb_frags);
+ 
+ /**
+  *	skb_panic - private function for out-of-line support
+@@ -342,7 +340,7 @@
+ 
+ 	if (skb && frag_size) {
+ 		skb->head_frag = 1;
+-		if (page_is_pfmemalloc(virt_to_head_page(data)))
++		if (virt_to_head_page(data)->pfmemalloc)
+ 			skb->pfmemalloc = 1;
+ 	}
+ 	return skb;
+@@ -2978,12 +2976,11 @@
+  */
+ unsigned char *skb_pull_rcsum(struct sk_buff *skb, unsigned int len)
+ {
+-	unsigned char *data = skb->data;
+-
+ 	BUG_ON(len > skb->len);
+-	__skb_pull(skb, len);
+-	skb_postpull_rcsum(skb, data, len);
+-	return skb->data;
++	skb->len -= len;
++	BUG_ON(skb->len < skb->data_len);
++	skb_postpull_rcsum(skb, skb->data, len);
++	return skb->data += len;
+ }
+ EXPORT_SYMBOL_GPL(skb_pull_rcsum);
+ 
+@@ -3222,115 +3219,196 @@
  }
  EXPORT_SYMBOL_GPL(skb_segment);
  
 -int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
-+void skb_gro_flush(struct sk_buff_head_gro *ofo_queue, struct sk_buff *skb) {
-+
-+	struct sk_buff *p = ofo_queue->next, *p2;
-+	unsigned qlen = 0, skb_num = 0;
-+
-+	if (skb == NULL) {
-+		printk(KERN_ERR "skb_gro_flush second parameter cannot be NULL\n");
-+		BUG_ON(skb == NULL);
-+	}
-+
-+	while (p != NULL) {
-+
-+		p2 = NAPI_GRO_CB(p)->next;
-+
-+		qlen += NAPI_GRO_CB(p)->len;
-+		skb_num++;
-+
-+		ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
-+		ofo_queue->skb_num--;
-+		ofo_queue->next = p2;
-+		ofo_queue->seq_next = NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len;
-+		
-+		napi_gro_complete(p);
-+		if (p != skb)
-+			p = p2;
-+		else {
-+			if (p2) {
-+				NAPI_GRO_CB(p2)->prev = NULL;
-+			} else {
-+				ofo_queue->prev = NULL;
-+			}
-+			break;
-+		}
-+	}
-+
-+
-+
-+	printk(KERN_NOTICE "skb_gro_flush qlen %u skb %u\n", qlen, skb_num);
-+}
-+
-+void skb_gro_free(struct sk_buff *skb) {
-+	if (NAPI_GRO_CB(skb)->free == NAPI_GRO_FREE_STOLEN_HEAD)
-+		kmem_cache_free(skbuff_head_cache, skb);
-+	else
-+		__kfree_skb(skb);
-+}
-+
-+int skb_gro_merge(struct sk_buff *p, struct sk_buff *skb)
- {
+-{
 -	struct skb_shared_info *pinfo, *skbinfo = skb_shinfo(skb);
-+	struct skb_shared_info *pinfo = skb_shinfo(p), *skbinfo = skb_shinfo(skb);
- 	unsigned int offset = skb_gro_offset(skb);
- 	unsigned int headlen = skb_headlen(skb);
--	struct sk_buff *nskb, *lp, *p = *head;
- 	unsigned int len = skb_gro_len(skb);
- 	unsigned int delta_truesize;
--	unsigned int headroom;
- 
- 	if (unlikely(p->len + len >= 65536))
- 		return -E2BIG;
- 
+-	unsigned int offset = skb_gro_offset(skb);
+-	unsigned int headlen = skb_headlen(skb);
+-	unsigned int len = skb_gro_len(skb);
+-	struct sk_buff *lp, *p = *head;
+-	unsigned int delta_truesize;
+-
+-	if (unlikely(p->len + len >= 65536))
+-		return -E2BIG;
+-
 -	lp = NAPI_GRO_CB(p)->last;
 -	pinfo = skb_shinfo(lp);
 -
- 	if (headlen <= offset) {
- 		skb_frag_t *frag;
- 		skb_frag_t *frag2;
-@@ -3119,7 +3161,7 @@
- 		int nr_frags = pinfo->nr_frags + i;
- 
- 		if (nr_frags > MAX_SKB_FRAGS)
+-	if (headlen <= offset) {
+-		skb_frag_t *frag;
+-		skb_frag_t *frag2;
+-		int i = skbinfo->nr_frags;
+-		int nr_frags = pinfo->nr_frags + i;
+-
+-		if (nr_frags > MAX_SKB_FRAGS)
 -			goto merge;
-+			return -E2BIG;
- 
- 		offset -= headlen;
- 		pinfo->nr_frags = nr_frags;
-@@ -3152,7 +3194,7 @@
- 		unsigned int first_offset;
- 
- 		if (nr_frags + 1 + skbinfo->nr_frags > MAX_SKB_FRAGS)
+-
+-		offset -= headlen;
+-		pinfo->nr_frags = nr_frags;
+-		skbinfo->nr_frags = 0;
+-
+-		frag = pinfo->frags + nr_frags;
+-		frag2 = skbinfo->frags + i;
+-		do {
+-			*--frag = *--frag2;
+-		} while (--i);
+-
+-		frag->page_offset += offset;
+-		skb_frag_size_sub(frag, offset);
+-
+-		/* all fragments truesize : remove (head size + sk_buff) */
+-		delta_truesize = skb->truesize -
+-				 SKB_TRUESIZE(skb_end_offset(skb));
+-
+-		skb->truesize -= skb->data_len;
+-		skb->len -= skb->data_len;
+-		skb->data_len = 0;
+-
+-		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE;
+-		goto done;
+-	} else if (skb->head_frag) {
+-		int nr_frags = pinfo->nr_frags;
+-		skb_frag_t *frag = pinfo->frags + nr_frags;
+-		struct page *page = virt_to_head_page(skb->head);
+-		unsigned int first_size = headlen - offset;
+-		unsigned int first_offset;
+-
+-		if (nr_frags + 1 + skbinfo->nr_frags > MAX_SKB_FRAGS)
 -			goto merge;
-+			return -E2BIG;
+-
+-		first_offset = skb->data -
+-			       (unsigned char *)page_address(page) +
+-			       offset;
+-
+-		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;
+-
+-		frag->page.p	  = page;
+-		frag->page_offset = first_offset;
+-		skb_frag_size_set(frag, first_size);
+-
+-		memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
+-		/* We dont need to clear skbinfo->nr_frags here */
++void skb_gro_flush(struct sk_buff_head_gro *ofo_queue, struct sk_buff *skb) {
  
- 		first_offset = skb->data -
- 			       (unsigned char *)page_address(page) +
-@@ -3171,85 +3213,173 @@
- 		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE_STOLEN_HEAD;
- 		goto done;
- 	}
--	/* switch back to head shinfo */
--	pinfo = skb_shinfo(p);
--
--	if (pinfo->frag_list)
--		goto merge;
--	if (skb_gro_len(p) != pinfo->gso_size)
--		return -E2BIG;
--
--	headroom = skb_headroom(p);
--	nskb = alloc_skb(headroom + skb_gro_offset(p), GFP_ATOMIC);
--	if (unlikely(!nskb))
--		return -ENOMEM;
--
--	__copy_skb_header(nskb, p);
--	nskb->mac_len = p->mac_len;
--
--	skb_reserve(nskb, headroom);
--	__skb_put(nskb, skb_gro_offset(p));
--
--	skb_set_mac_header(nskb, skb_mac_header(p) - p->data);
--	skb_set_network_header(nskb, skb_network_offset(p));
--	skb_set_transport_header(nskb, skb_transport_offset(p));
--
--	__skb_pull(p, skb_gro_offset(p));
--	memcpy(skb_mac_header(nskb), skb_mac_header(p),
--	       p->data - skb_mac_header(p));
--
--	skb_shinfo(nskb)->frag_list = p;
--	skb_shinfo(nskb)->gso_size = pinfo->gso_size;
--	pinfo->gso_size = 0;
--	__skb_header_release(p);
--	NAPI_GRO_CB(nskb)->last = p;
--
--	nskb->data_len += p->len;
--	nskb->truesize += p->truesize;
--	nskb->len += p->len;
--
--	*head = nskb;
--	nskb->next = p->next;
--	p->next = NULL;
--
--	p = nskb;
--
+-		delta_truesize = skb->truesize - SKB_DATA_ALIGN(sizeof(struct sk_buff));
+-		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE_STOLEN_HEAD;
+-		goto done;
+-	}
++        struct sk_buff *p = ofo_queue->next, *p2;
++        unsigned qlen = 0, skb_num = 0;
++        u64 timestamp;
++
++        if (skb == NULL) {
++                printk(KERN_ERR "skb_gro_flush second parameter cannot be NULL\n");
++                BUG_ON(skb == NULL);
++        }
++
++        timestamp = ktime_to_ns(ktime_get());
++        printk(KERN_INFO "queue age: %llu\n", timestamp - ofo_queue->timestamp);
++	ofo_queue->timestamp = timestamp;
++	ofo_queue->flushed = true;
++
++        while (p != NULL) {
++
++                p2 = NAPI_GRO_CB(p)->next;
++
++                qlen += NAPI_GRO_CB(p)->len;
++                skb_num++;
++
++                ofo_queue->qlen -= NAPI_GRO_CB(p)->len;
++                ofo_queue->skb_num--;
++                ofo_queue->next = p2;
++                ofo_queue->seq_next = NAPI_GRO_CB(p)->seq + NAPI_GRO_CB(p)->len;
++
++                napi_gro_complete(p);
++                if (p != skb)
++                        p = p2;
++                else {
++                        if (p2) {
++                                NAPI_GRO_CB(p2)->prev = NULL;
++                        } else {
++                                ofo_queue->prev = NULL;
++                        }
++                        break;
++                }
++        }
++
++        printk(KERN_NOTICE "skb_gro_flush qlen %u skb %u\n", qlen, skb_num);
++}
++
++void skb_gro_free(struct sk_buff *skb) {
++        if (NAPI_GRO_CB(skb)->free == NAPI_GRO_FREE_STOLEN_HEAD)
++                kmem_cache_free(skbuff_head_cache, skb);
++        else
++                __kfree_skb(skb);
++}
++
++int skb_gro_merge(struct sk_buff *p, struct sk_buff *skb)
++{
++        struct skb_shared_info *pinfo = skb_shinfo(p), *skbinfo = skb_shinfo(skb);
++        unsigned int offset = skb_gro_offset(skb);
++        unsigned int headlen = skb_headlen(skb);
++        unsigned int len = skb_gro_len(skb);
++        unsigned int delta_truesize;
++        struct iphdr *iph;
++        struct iphdr *iph2;
++		struct tcphdr *th;
++		struct tcphdr *th2;
++		__be32 flags, flags2;
++		unsigned int thlen;
++		int i;
+ 
 -merge:
 -	delta_truesize = skb->truesize;
 -	if (offset > headlen) {
@@ -882,9 +2466,46 @@ diff -Naur linux-3.18.5/net/core/skbuff.c linux-3.18.5-juggler/net/core/skbuff.c
 -		skb->len -= eat;
 -		offset = headlen;
 -	}
--
++        // check ACK, ECN in IP, TCP flags and options
++                if (p->network_header >= p->tail) {
++                        iph = skb_gro_header_fast(p, p->network_header - p->tail);
++                } else {
++                        iph = ip_hdr(p);
++                }
++                if (skb->network_header >= skb->tail) {
++                        iph2 = skb_gro_header_fast(skb, skb->network_header - skb->tail);
++                } else {
++                        iph2 = ip_hdr(skb);
++                }
++                if (p->transport_header >= p->tail) {
++                        th = skb_gro_header_fast(p, p->transport_header - p->tail);
++                } else {
++                        th = tcp_hdr(p);
++                }
++                if (skb->transport_header >= skb->tail) {
++                        th2 = skb_gro_header_fast(skb, skb->transport_header - skb->tail);
++                } else {
++                        th2 = tcp_hdr(skb);
++                }
++		flags = tcp_flag_word(th);
++		flags2 = tcp_flag_word(th2);
++		if ((__force int)(flags & TCP_FLAG_PSH) ||
++				(__force int)(iph->tos ^ iph2->tos) ||
++				(__force int)(th->ack_seq ^ th2->ack_seq) ||
++				(__force int)((tcp_flag_word(th) ^ tcp_flag_word(th2)) & (TCP_FLAG_CWR | TCP_FLAG_ECE | TCP_FLAG_ACK)) ||
++				(__force int)(th->doff ^ th2->doff)) {
++			return SKB_MERGE_FAIL;
++		} else {
++			thlen = th->doff * 4;
++			for (i = sizeof(*th); i < thlen; i += 4) {
++				if (*(u32 *)((u8 *)th + i) ^ *(u32 *)((u8 *)th2 + i)) {
++					return SKB_MERGE_FAIL;
++				}
++			}
++		}
+ 
 -	__skb_pull(skb, offset);
--
+ 
 -	if (NAPI_GRO_CB(p)->last == p)
 -		skb_shinfo(p)->frag_list = skb;
 -	else
@@ -892,186 +2513,246 @@ diff -Naur linux-3.18.5/net/core/skbuff.c linux-3.18.5-juggler/net/core/skbuff.c
 -	NAPI_GRO_CB(p)->last = skb;
 -	__skb_header_release(skb);
 -	lp = p;
-+	
-+	return -EINVAL;
++	// check gso_size
++	if (unlikely(NAPI_GRO_CB(p)->gso_end) ||
++			(pinfo->gso_size > skbinfo->gso_size && NAPI_GRO_CB(skb)->count > 1) ||
++			pinfo->gso_size < skbinfo->gso_size) {
++		return SKB_MERGE_FAIL;
++	}
++
++        if (unlikely(p->len + len >= 65536))
++                return SKB_MERGE_2BIG;
++
++        if (headlen <= offset) {
++                skb_frag_t *frag;
++                skb_frag_t *frag2;
++                int i = skbinfo->nr_frags;
++                int nr_frags = pinfo->nr_frags + i;
++
++                if (nr_frags > MAX_SKB_FRAGS)
++                        return SKB_MERGE_2BIG;
++
++                offset -= headlen;
++                pinfo->nr_frags = nr_frags;
++                skbinfo->nr_frags = 0;
++
++                frag = pinfo->frags + nr_frags;
++                frag2 = skbinfo->frags + i;
++                do {
++                        *--frag = *--frag2;
++                } while (--i);
++
++                frag->page_offset += offset;
++                skb_frag_size_sub(frag, offset);
++
++                /* all fragments truesize : remove (head size + sk_buff) */
++                delta_truesize = skb->truesize -
++                                 SKB_TRUESIZE(skb_end_offset(skb));
++
++                skb->truesize -= skb->data_len;
++                skb->len -= skb->data_len;
++                skb->data_len = 0;
++
++                NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE;
++                goto done;
++        } else if (skb->head_frag) {
++                int nr_frags = pinfo->nr_frags;
++                skb_frag_t *frag = pinfo->frags + nr_frags;
++                struct page *page = virt_to_head_page(skb->head);
++                unsigned int first_size = headlen - offset;
++                unsigned int first_offset;
++
++                if (nr_frags + 1 + skbinfo->nr_frags > MAX_SKB_FRAGS)
++                        return SKB_MERGE_2BIG;
++
++                first_offset = skb->data -
++                               (unsigned char *)page_address(page) +
++                               offset;
++
++                pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;
++
++                frag->page.p      = page;
++                frag->page_offset = first_offset;
++                skb_frag_size_set(frag, first_size);
++
++                memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
++                /* We dont need to clear skbinfo->nr_frags here */
++
++                delta_truesize = skb->truesize - SKB_DATA_ALIGN(sizeof(struct sk_buff));
++                NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE_STOLEN_HEAD;
++                goto done;
++        }
++	printk(KERN_INFO "skb merge invalid\n");
++        return SKB_MERGE_INVAL;
  
  done:
 -	NAPI_GRO_CB(p)->count++;
-+	NAPI_GRO_CB(p)->count += NAPI_GRO_CB(skb)->count;
-+	NAPI_GRO_CB(p)->len += NAPI_GRO_CB(skb)->len;
- 	p->data_len += len;
- 	p->truesize += delta_truesize;
- 	p->len += len;
+-	p->data_len += len;
+-	p->truesize += delta_truesize;
+-	p->len += len;
 -	if (lp != p) {
 -		lp->data_len += len;
 -		lp->truesize += delta_truesize;
 -		lp->len += len;
 -	}
- 	NAPI_GRO_CB(skb)->same_flow = 1;
- 	return 0;
+-	NAPI_GRO_CB(skb)->same_flow = 1;
+-	return 0;
++	tcp_flag_word(th) |= flags2 & TCP_FLAG_PSH;
++	if (NAPI_GRO_CB(skb)->gso_end || pinfo->gso_size > skbinfo->gso_size) {
++		NAPI_GRO_CB(p)->gso_end = 1;
++	}
++	skbinfo->gso_size = 0;
++        NAPI_GRO_CB(p)->count += NAPI_GRO_CB(skb)->count;
++        NAPI_GRO_CB(p)->len += NAPI_GRO_CB(skb)->len;
++        p->data_len += len;
++        p->truesize += delta_truesize;
++        p->len += len;
++        NAPI_GRO_CB(skb)->same_flow = 1;
++        return 0;
  }
  
-+//int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
-+//{
-+//	struct skb_shared_info *pinfo, *skbinfo = skb_shinfo(skb);
-+//	unsigned int offset = skb_gro_offset(skb);
-+//	unsigned int headlen = skb_headlen(skb);
-+//	struct sk_buff *nskb, *lp, *p = *head;
-+//	unsigned int len = skb_gro_len(skb);
-+//	unsigned int delta_truesize;
-+//	unsigned int headroom;//
-+
-+//	if (unlikely(p->len + len >= 65536))
-+//		return -E2BIG;//
-+
-+//	lp = NAPI_GRO_CB(p)->last;
-+//	pinfo = skb_shinfo(lp);//
-+
-+//	if (headlen <= offset) {
-+//		skb_frag_t *frag;
-+//		skb_frag_t *frag2;
-+//		int i = skbinfo->nr_frags;
-+//		int nr_frags = pinfo->nr_frags + i;//
-+
-+//		if (nr_frags > MAX_SKB_FRAGS)
-+//			goto merge;//
-+
-+//		offset -= headlen;
-+//		pinfo->nr_frags = nr_frags;
-+//		skbinfo->nr_frags = 0;//
-+
-+//		frag = pinfo->frags + nr_frags;
-+//		frag2 = skbinfo->frags + i;
-+//		do {
-+//			*--frag = *--frag2;
-+//		} while (--i);//
-+
-+//		frag->page_offset += offset;
-+//		skb_frag_size_sub(frag, offset);//
-+
-+//		/* all fragments truesize : remove (head size + sk_buff) */
-+//		delta_truesize = skb->truesize -
-+//				 SKB_TRUESIZE(skb_end_offset(skb));//
-+
-+//		skb->truesize -= skb->data_len;
-+//		skb->len -= skb->data_len;
-+//		skb->data_len = 0;//
-+
-+//		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE;
-+//		goto done;
-+//	} else if (skb->head_frag) {
-+//		int nr_frags = pinfo->nr_frags;
-+//		skb_frag_t *frag = pinfo->frags + nr_frags;
-+//		struct page *page = virt_to_head_page(skb->head);
-+//		unsigned int first_size = headlen - offset;
-+//		unsigned int first_offset;//
-+
-+//		if (nr_frags + 1 + skbinfo->nr_frags > MAX_SKB_FRAGS)
-+//			goto merge;//
-+
-+//		first_offset = skb->data -
-+//			       (unsigned char *)page_address(page) +
-+//			       offset;//
-+
-+//		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;//
-+
-+//		frag->page.p	  = page;
-+//		frag->page_offset = first_offset;
-+//		skb_frag_size_set(frag, first_size);//
-+
-+//		memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
-+//		/* We dont need to clear skbinfo->nr_frags here *///
-+
-+//		delta_truesize = skb->truesize - SKB_DATA_ALIGN(sizeof(struct sk_buff));
-+//		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE_STOLEN_HEAD;
-+//		goto done;
-+//	}
-+//	/* switch back to head shinfo */
-+//	pinfo = skb_shinfo(p);//
-+
-+//	if (pinfo->frag_list)
-+//		goto merge;
-+//	if (skb_gro_len(p) != pinfo->gso_size)
-+//		return -E2BIG;//
-+
-+//	headroom = skb_headroom(p);
-+//	nskb = alloc_skb(headroom + skb_gro_offset(p), GFP_ATOMIC);
-+//	if (unlikely(!nskb))
-+//		return -ENOMEM;//
-+
-+//	__copy_skb_header(nskb, p);
-+//	nskb->mac_len = p->mac_len;//
-+
-+//	skb_reserve(nskb, headroom);
-+//	__skb_put(nskb, skb_gro_offset(p));//
-+
-+//	skb_set_mac_header(nskb, skb_mac_header(p) - p->data);
-+//	skb_set_network_header(nskb, skb_network_offset(p));
-+//	skb_set_transport_header(nskb, skb_transport_offset(p));//
-+
-+//	__skb_pull(p, skb_gro_offset(p));
-+//	memcpy(skb_mac_header(nskb), skb_mac_header(p),
-+//	       p->data - skb_mac_header(p));//
-+
-+//	skb_shinfo(nskb)->frag_list = p;
-+//	skb_shinfo(nskb)->gso_size = pinfo->gso_size;
-+//	pinfo->gso_size = 0;
-+//	__skb_header_release(p);
-+//	NAPI_GRO_CB(nskb)->last = p;//
-+
-+//	nskb->data_len += p->len;
-+//	nskb->truesize += p->truesize;
-+//	nskb->len += p->len;//
-+
-+//	*head = nskb;
-+//	nskb->next = p->next;
-+//	p->next = NULL;//
-+
-+//	p = nskb;//
-+
-+//merge:
-+//	delta_truesize = skb->truesize;
-+//	if (offset > headlen) {
-+//		unsigned int eat = offset - headlen;//
-+
-+//		skbinfo->frags[0].page_offset += eat;
-+//		skb_frag_size_sub(&skbinfo->frags[0], eat);
-+//		skb->data_len -= eat;
-+//		skb->len -= eat;
-+//		offset = headlen;
-+//	}//
-+
-+//	__skb_pull(skb, offset);//
-+
-+//	if (NAPI_GRO_CB(p)->last == p)
-+//		skb_shinfo(p)->frag_list = skb;
-+//	else
-+//		NAPI_GRO_CB(p)->last->next = skb;
-+//	NAPI_GRO_CB(p)->last = skb;
-+//	__skb_header_release(skb);
-+//	lp = p;//
-+
-+//done:
-+//	NAPI_GRO_CB(p)->count++;
-+//	p->data_len += len;
-+//	p->truesize += delta_truesize;
-+//	p->len += len;
-+//	if (lp != p) {
-+//		lp->data_len += len;
-+//		lp->truesize += delta_truesize;
-+//		lp->len += len;
-+//	}
-+//	NAPI_GRO_CB(skb)->same_flow = 1;
-+//	return 0;
-+//}
-+
  void __init skb_init(void)
- {
- 	skbuff_head_cache = kmem_cache_create("skbuff_head_cache",
-diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp_offload.c
---- linux-3.18.5/net/ipv4/tcp_offload.c	2015-01-30 09:41:03.000000000 +0800
-+++ linux-3.18.5-juggler/net/ipv4/tcp_offload.c	2016-09-09 05:45:11.957822358 +0800
-@@ -178,17 +178,33 @@
+@@ -3663,8 +3741,7 @@
+ 	serr->ee.ee_info = tstype;
+ 	if (sk->sk_tsflags & SOF_TIMESTAMPING_OPT_ID) {
+ 		serr->ee.ee_data = skb_shinfo(skb)->tskey;
+-		if (sk->sk_protocol == IPPROTO_TCP &&
+-		    sk->sk_type == SOCK_STREAM)
++		if (sk->sk_protocol == IPPROTO_TCP)
+ 			serr->ee.ee_data -= sk->sk_tskey;
+ 	}
+ 
+@@ -4203,8 +4280,7 @@
+ 		return NULL;
+ 	}
+ 
+-	memmove(skb->data - ETH_HLEN, skb->data - skb->mac_len - VLAN_HLEN,
+-		2 * ETH_ALEN);
++	memmove(skb->data - ETH_HLEN, skb->data - VLAN_ETH_HLEN, 2 * ETH_ALEN);
+ 	skb->mac_header += VLAN_HLEN;
+ 	return skb;
+ }
+diff -Naur linux-4.1.32/net/ipv4/af_inet.c linux-4.1.32-juggler/net/ipv4/af_inet.c
+--- linux-4.1.32/net/ipv4/af_inet.c	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/net/ipv4/af_inet.c	2016-09-09 06:12:15.549823145 +0800
+@@ -228,8 +228,6 @@
+ 				err = 0;
+ 			if (err)
+ 				goto out;
+-
+-			tcp_fastopen_init_key_once(true);
+ 		}
+ 		err = inet_csk_listen_start(sk, backlog);
+ 		if (err)
+@@ -259,9 +257,6 @@
+ 	int try_loading_module = 0;
+ 	int err;
+ 
+-	if (protocol < 0 || protocol >= IPPROTO_MAX)
+-		return -EINVAL;
+-
+ 	sock->state = SS_UNCONNECTED;
+ 
+ 	/* Look for the requested type/protocol pair. */
+@@ -1352,7 +1347,7 @@
+ 		/* All fields must match except length and checksum. */
+ 		NAPI_GRO_CB(p)->flush |=
+ 			(iph->ttl ^ iph2->ttl) |
+-			(iph->tos ^ iph2->tos) |
++			//(iph->tos ^ iph2->tos) |
+ 			((iph->frag_off ^ iph2->frag_off) & htons(IP_DF));
+ 
+ 		/* Save the IP ID check to be included later when we get to
+diff -Naur linux-4.1.32/net/ipv4/.af_inet.c.swp linux-4.1.32-juggler/net/ipv4/.af_inet.c.swp
+--- linux-4.1.32/net/ipv4/.af_inet.c.swp	1970-01-01 08:00:00.000000000 +0800
++++ linux-4.1.32-juggler/net/ipv4/.af_inet.c.swp	2016-09-09 06:12:15.549823145 +0800
+@@ -0,0 +1,30 @@
++b0VIM 7.3      ¶I1V"É  gengyl08                                Yilongs-MacBook-Air.local               ~gengyl08/GoogleDrive/Stanford/BalajiGroup/packet_reordering/linux-4.1/net/ipv4/af_inet.c                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    utf-8 3210    #"! U                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 tp           m                     ˇˇˇˇˇˇˇˇí       n              ˛ˇˇˇˇˇˇˇõ                     ˝ˇˇˇˇˇˇˇ}       õ             ¸ˇˇˇˇˇˇˇí                    ˚ˇˇˇˇˇˇˇè       ™             ˙ˇˇˇˇˇˇˇÑ       9             ˘ˇˇˇˇˇˇˇç       Ω             ¯ˇˇˇˇˇˇˇç       J                    Ñ       ◊             ˆˇˇˇˇˇˇˇô       [             ıˇˇˇˇˇˇˇà       Ù             Ùˇˇˇˇˇˇˇ≤       |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ad  
++   ⁄     m       ˝  ∑  v  5  2      Ì  ∏  å  h  e  H  E  :    ›  £  |  Z  2  ˇ  Ì  ’  ¢  s  C    Ó  ‡  ∏  Ä  U    Ò
++  «
++  ©
++  Ñ
++  T
++  @
++  
++  ‹	  ±	  Ü	  U	  F	  	  Î     û  p  =    ·  ∫  Ö  O  ,  ˘  ∆  √  Å  A     √  ø  æ  ù  ú  Ö  l  S  9  #  	  Ô  ÷  Ω  £  à  q  S  :  $    Ô  ◊  ø  ù  É  k  j  Q  P  8       Â  À  ∑  ù  à  q  Y  3    	    ⁄  Ÿ            #include <net/ping.h> #include <net/udplite.h> #include <net/udp.h> #include <net/tcp.h> #include <net/inet_connection_sock.h> #include <net/ip_fib.h> #include <net/route.h> #include <net/arp.h> #include <net/protocol.h> #include <net/ip.h> #include <net/checksum.h> #include <linux/netdevice.h> #include <linux/inetdevice.h> #include <linux/igmp.h> #include <linux/inet.h>  #include <asm/uaccess.h>  #include <linux/slab.h> #include <linux/random.h> #include <linux/netfilter_ipv4.h> #include <linux/poll.h> #include <linux/init.h> #include <linux/stat.h> #include <linux/interrupt.h> #include <linux/mm.h> #include <linux/fcntl.h> #include <linux/capability.h> #include <linux/net.h> #include <linux/sockios.h> #include <linux/string.h> #include <linux/timer.h> #include <linux/sched.h> #include <linux/module.h> #include <linux/kernel.h> #include <linux/in.h> #include <linux/socket.h> #include <linux/types.h> #include <linux/errno.h> #include <linux/err.h>  #define pr_fmt(fmt) "IPv4: " fmt   */  *		2 of the License, or (at your option) any later version.  *		as published by the Free Software Foundation; either version  *		modify it under the terms of the GNU General Public License  *		This program is free software; you can redistribute it and/or  *  *		Andi Kleen	:	Fix inet_stream_connect TCP race.  *		Cyrus Durgin	:	Cleaned up file for kmod hacks.  *					Some other random speedups.  *		David S. Miller	:	New socket lookup architecture.  *	Willy Konynenberg	:	Transparent proxying support.  *		Mike McLagan	:	ADD/DEL DLCI Ioctls  *		Alan Cox	:	Loosened bind a little.  *		Alan Cox	:	Locked down bind (see security list).  *		Alan Cox	:	Only sendmsg/recvmsg now supported.  *		Alan Cox	:	sendmsg/recvmsg basic support.  *		Germano Caronni	:	Assorted small races.  *					interpretation of listen.  *		Alan Cox	:	BSD rather than common sense  *		Alan Cox	:	New buffering now used smartly.  *					dumbly.  *		Alan Cox	:	New buffering throughout IP. Used  *					specifically application requested.  *					(eg for big web sites), but only if  *		Alan Cox	:	Allow large numbers of pending sockets  *		Matt Day	:	nonblock connect error handler  *					compactness.  *		Alan Cox	:	memzero the socket structure for  *		Alan Cox	:	routing cache support  *					compatibility tests...  *					in this respect so be careful with  *					Note that FreeBSD at least was broken  *		Alan Cox	:	bind() works correctly for RAW sockets.  *					sockets. Stops FTP netin:.. I hope.  *		Alan Cox	:	bind() shouldn't abort existing but dead  *		Tony Gale 	:	Fixed reuse semantics.  *		Alan Cox,  *		Niibe Yutaka	:	4.4BSD style write async I/O  *					some RPC stuff seems happier.  *					With this fixed and the accept bug fixed  *					moved to close when you look carefully.  *		Alan Cox	:	Semantics of SO_LINGER aren't state  *					when accept() ed  *					structures  *		Alan Cox	:	Keep correct socket pointer on sock  *		Alan Cox	:	Asynchronous I/O support  *					don't return -EINPROGRESS.  *					so sockets that fail to connect  *		John Richardson :	Fix non blocking error in connect()  *		A.N.Kuznetsov	:	Socket death error in accept().  *		Karl Knutson	:	Socket protocol table  *		piggy,  *  * Changes (see also sock.c)  *  *		Alan Cox, <A.Cox@swansea.ac.uk>  *		Florian La Roche, <flla@stud.uni-sb.de>  *		Fred N. van Kempen, <waltje@uWalt.NL.Mugnet.ORG>  * Authors:	Ross Biro  *  *		PF_INET protocol family socket handler.  *  *		interface as the means of communication with the user level.  *		operating system.  INET is implemented using the  BSD Socket  * INET		An implementation of the TCP/IP protocol suite for the LINUX /* ad     Û     ≤       ⁄  ®  ù  õ  ö  z  y  >      
++  	  Á  Â  Ã  ∂  £  ¢  k  j  F  =  1  0      ‚  ·  Ω  ¥  ì  í  m  d  C  B  >        Î  Í  ’  ª  ¥  ≥  Ø  è  ä  â  O    ‡  ™  r  <  !  Á
++  ∞
++  ©
++  ®
++  k
++  9
++  $
++  #
++  ·	  ≈	  ƒ	  ¿	  ¶	  °	  †	  ì	  í	  é	  u	  p	  o	  c	  b	  R	  Q	  "	  	  	  Ú  Â  ‰  ≈  Ø  Æ  †  ü  õ  Å  |  {  e  -  ,  (    ˇ  ·  Œ  ò  ë  ê  s  4  0    
++  	  Ú  æ  Ω  ™  ©  ô  ò  x  w  n  i  ]  C  %    Ì  ”  µ  ™  ®  ß  è  é  ?  >  (    ˇ  Ú  Ò  €  À  ¥  §  ç  }  f  U  ;  *  %      ¸  Ú  ﬂ  ÷  √  ∫  ®  ü  ê  Ö  É  Ç  g  @  >  3  1      Ù  Û  Ú                  MODULE_ALIAS_NETPROTO(PF_INET);  #endif /* CONFIG_PROC_FS */ } 	return 0; { static int __init ipv4_proc_init(void) #else /* CONFIG_PROC_FS */  } 	goto out; 	rc = -ENOMEM; out_raw: 	raw_proc_exit(); out_tcp: 	tcp4_proc_exit(); out_udp: 	udp4_proc_exit(); out_ping: 	ping_proc_exit(); out_misc: 	return rc; out: 		goto out_misc; 	if (ip_misc_proc_init()) 		goto out_ping; 	if (ping_proc_init()) 		goto out_udp; 	if (udp4_proc_init()) 		goto out_tcp; 	if (tcp4_proc_init()) 		goto out_raw; 	if (raw_proc_init())  	int rc = 0; { static int __init ipv4_proc_init(void) #ifdef CONFIG_PROC_FS  /* ------------------------------------------------------------------------ */  fs_initcall(inet_init);  } 	goto out; 	proto_unregister(&tcp_prot); out_unregister_tcp_proto: 	proto_unregister(&udp_prot); out_unregister_udp_proto: 	proto_unregister(&raw_prot); out_unregister_raw_proto: 	return rc; out: 	rc = 0;  	dev_add_pack(&ip_packet_type);  	ipfrag_init();  	ipv4_proc_init();  		pr_crit("%s: Cannot init ipv4 mibs\n", __func__); 	if (init_ipv4_mibs())  	 */ 	 *	Initialise per-cpu ipv4 mibs 	/* 		pr_crit("%s: Cannot init ipv4 inet pernet ops\n", __func__); 	if (init_inet_pernet_ops())  #endif 		pr_crit("%s: Cannot init ipv4 mroute\n", __func__); 	if (ip_mr_init()) #if defined(CONFIG_IP_MROUTE) 	 */ 	 *	Initialise the multicast router 	/*  		panic("Failed to create the ICMP control socket.\n"); 	if (icmp_init() < 0)  	 */ 	 *	Set the ICMP layer up 	/*  	ping_init();  	udplite4_register(); 	/* Add UDP-Lite (RFC 3828) */  	udp_init(); 	/* Setup UDP memory threshold */  	tcp_init(); 	/* Setup TCP slab cache for open requests. */  	tcp_v4_init();  	ip_init();  	 */ 	 *	Set the IP module up 	/*  	arp_init();  	 */ 	 *	Set the ARP module up 	/*  		inet_register_protosw(q); 	for (q = inetsw_array; q < &inetsw_array[INETSW_ARRAY_LEN]; ++q)  		INIT_LIST_HEAD(r); 	for (r = &inetsw[0]; r < &inetsw[SOCK_MAX]; ++r) 	/* Register the socket-side information for inet_create. */  #endif 		pr_crit("%s: Cannot add IGMP protocol\n", __func__); 	if (inet_add_protocol(&igmp_protocol, IPPROTO_IGMP) < 0) #ifdef CONFIG_IP_MULTICAST 		pr_crit("%s: Cannot add TCP protocol\n", __func__); 	if (inet_add_protocol(&tcp_protocol, IPPROTO_TCP) < 0) 		pr_crit("%s: Cannot add UDP protocol\n", __func__); 	if (inet_add_protocol(&udp_protocol, IPPROTO_UDP) < 0) 		pr_crit("%s: Cannot add ICMP protocol\n", __func__); 	if (inet_add_protocol(&icmp_protocol, IPPROTO_ICMP) < 0)  	 */ 	 *	Add all the base protocols. 	/*  #endif 	ip_static_sysctl_init(); #ifdef CONFIG_SYSCTL  	(void)sock_register(&inet_family_ops);  	 */ 	 *	Tell SOCKET that we are alive... 	/*  		goto out_unregister_raw_proto; 	if (rc) 	rc = proto_register(&ping_prot, 1);  		goto out_unregister_udp_proto; 	if (rc) 	rc = proto_register(&raw_prot, 1);  		goto out_unregister_tcp_proto; 	if (rc) 	rc = proto_register(&udp_prot, 1);  		goto out; 	if (rc) 	rc = proto_register(&tcp_prot, 1);  	sock_skb_cb_check_size(sizeof(struct inet_skb_parm));  	int rc = -EINVAL; 	struct list_head *r; 	struct inet_protosw *q; { static int __init inet_init(void)  }; 	.func = ip_rcv, 	.type = cpu_to_be16(ETH_P_IP), static struct packet_type ip_packet_type __read_mostly = {  fs_initcall(ipv4_offload_init);  } 	return 0; 	//inet_add_offload(&ipip_offload, IPPROTO_IPIP); 	dev_add_offload(&ip_packet_offload); ad     0     Ñ       ¡  ò  å  u  t  I  =    Ó  Ì  À     ß  ¶  ã  N  #    ‰  „  µ  Ö  Q  P  5  )  (      ﬁ  Õ  µ  é  |  Y  4  )      ·  À  æ  ù  n  P  O  J  <  :  9    Á
++  Â
++  ª
++  õ
++  ~
++  j
++  P
++  <
++  )
++  
++  
++  ˚	  ˙	  ﬁ	  ¬	  ú	  u	  H	  2	  %	  "	  !	  		  	  ˆ  »  û  ã  ä  q  ^  ]  2      ¸  ∞  §  £  Ä  j  i  G  :  9    ”  ï  U  <  6    –  í  p  c  _  ^  $  	  Ì  œ  ô  ò  Z    ﬂ  ®  ¢  Ö  G  %  "  !  ˛  €  ó  p  k  j  0         		/* Note : No need to call skb_gro_postpull_rcsum() here,  	 */ 	 * immediately following this IP hdr. 	/* The above will be needed by the transport layer if there is one 	skb_set_network_header(skb, off); 	NAPI_GRO_CB(skb)->flush |= flush;  	} 		NAPI_GRO_CB(p)->flush |= flush; 			    ((u16)(ntohs(iph2->id) + NAPI_GRO_CB(p)->count) ^ id); 		NAPI_GRO_CB(p)->flush_id = 		 */ 		 * correctly increment the IP ID for the outer hdrs. 		 * This is because some GSO/TSO implementations do not 		 * the transport layer so only the inner most IP ID is checked. 		/* Save the IP ID check to be included later when we get to  			((iph->frag_off ^ iph2->frag_off) & htons(IP_DF)); 			//(iph->tos ^ iph2->tos) | 			(iph->ttl ^ iph2->ttl) | 		NAPI_GRO_CB(p)->flush |= 		/* All fields must match except length and checksum. */  		} 			continue; 			NAPI_GRO_CB(p)->same_flow = 0; 		    ((__force u32)iph->daddr ^ (__force u32)iph2->daddr)) { 		    ((__force u32)iph->saddr ^ (__force u32)iph2->saddr) | 		if ((iph->protocol ^ iph2->protocol) | 		 */ 		 * at the same offset. 		 * hdr length so all the hdrs we'll need to verify will start 		 * (inner most) layer, we only aggregate pkts with the same 		/* The above works because, with the exception of the top 		iph2 = (struct iphdr *)(p->data + off);  			continue; 		if (!NAPI_GRO_CB(p)->same_flow)  		struct iphdr *iph2; 	for (p = *head; p; p = p->next) {  	id >>= 16; 	flush = (u16)((ntohl(*(__be32 *)iph) ^ skb_gro_len(skb)) | (id & ~IP_DF)); 	id = ntohl(*(__be32 *)&iph->id);  		goto out_unlock; 	if (unlikely(ip_fast_csum((u8 *)iph, 5)))  		goto out_unlock; 	if (*(u8 *)iph != 0x45)  		goto out_unlock; 	if (!ops || !ops->callbacks.gro_receive) 	ops = rcu_dereference(inet_offloads[proto]); 	rcu_read_lock();  	proto = iph->protocol;  	} 			goto out; 		if (unlikely(!iph)) 		iph = skb_gro_header_slow(skb, hlen, off); 	if (skb_gro_header_hard(skb, hlen)) { 	iph = skb_gro_header_fast(skb, off); 	hlen = off + sizeof(*iph); 	off = skb_gro_offset(skb);  	int proto; 	int flush = 1; 	unsigned int id; 	unsigned int off; 	unsigned int hlen; 	const struct iphdr *iph; 	struct sk_buff *p; 	struct sk_buff **pp = NULL; 	const struct net_offload *ops; 	struct sk_buff **head = &napi->gro_list; { 					 struct sk_buff *skb) static bool inet_gro_receive(struct napi_struct *napi,  } 	return segs; out:  	} while ((skb = skb->next)); 		skb->network_header = (u8 *)iph - skb->head; 			skb_reset_inner_headers(skb); 		if (encap) 		ip_send_check(iph); 		iph->tot_len = htons(skb->len - nhoff); 		} 			iph->id = htons(id++); 		} else { 			offset += skb->len - nhoff - ihl; 				iph->frag_off |= htons(IP_MF); 			if (skb->next) 			iph->frag_off = htons(offset >> 3); 			iph->id = htons(id); 		if (udpfrag) { 		iph = (struct iphdr *)(skb_mac_header(skb) + nhoff); 	do { 	skb = segs;  		goto out; 	if (IS_ERR_OR_NULL(segs))  		segs = ops->callbacks.gso_segment(skb, features); 	if (likely(ops && ops->callbacks.gso_segment)) 	ops = rcu_dereference(inet_offloads[proto]);  		udpfrag = proto == IPPROTO_UDP && !skb->encapsulation; 	else 		udpfrag = proto == IPPROTO_UDP && encap; 	    skb_shinfo(skb)->gso_type & (SKB_GSO_SIT|SKB_GSO_IPIP)) 	if (skb->encapsulation &&  	segs = ERR_PTR(-EPROTONOSUPPORT);  	skb_reset_transport_header(skb);  	SKB_GSO_CB(skb)->encap_level += ihl; 		features &= skb->dev->hw_enc_features; 	if (encap) 	encap = SKB_GSO_CB(skb)->encap_level > 0;  	__skb_pull(skb, ihl); 		goto out; 	if (unlikely(!pskb_may_pull(skb, ihl))) 	/* Warning: after this point, iph might be no longer valid */ 
+\ No newline at end of file
+diff -Naur linux-4.1.32/net/ipv4/tcp_offload.c linux-4.1.32-juggler/net/ipv4/tcp_offload.c
+--- linux-4.1.32/net/ipv4/tcp_offload.c	2016-09-03 11:40:20.000000000 +0800
++++ linux-4.1.32-juggler/net/ipv4/tcp_offload.c	2016-09-09 06:12:15.549823145 +0800
+@@ -86,19 +86,19 @@
+ 		int type = skb_shinfo(skb)->gso_type;
+ 
+ 		if (unlikely(type &
+-			     ~(SKB_GSO_TCPV4 |
+-			       SKB_GSO_DODGY |
+-			       SKB_GSO_TCP_ECN |
+-			       SKB_GSO_TCPV6 |
+-			       SKB_GSO_GRE |
+-			       SKB_GSO_GRE_CSUM |
+-			       SKB_GSO_IPIP |
+-			       SKB_GSO_SIT |
+-			       SKB_GSO_UDP_TUNNEL |
+-			       SKB_GSO_UDP_TUNNEL_CSUM |
+-			       SKB_GSO_TUNNEL_REMCSUM |
+-			       0) ||
+-			     !(type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6))))
++				 ~(SKB_GSO_TCPV4 |
++				   SKB_GSO_DODGY |
++				   SKB_GSO_TCP_ECN |
++				   SKB_GSO_TCPV6 |
++				   SKB_GSO_GRE |
++				   SKB_GSO_GRE_CSUM |
++				   SKB_GSO_IPIP |
++				   SKB_GSO_SIT |
++				   SKB_GSO_UDP_TUNNEL |
++				   SKB_GSO_UDP_TUNNEL_CSUM |
++				   SKB_GSO_TUNNEL_REMCSUM |
++				   0) ||
++				 !(type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6))))
+ 			goto out;
+ 
+ 		skb_shinfo(skb)->gso_segs = DIV_ROUND_UP(skb->len, mss);
+@@ -129,7 +129,7 @@
+ 		tcp_gso_tstamp(segs, skb_shinfo(gso_skb)->tskey, seq, mss);
+ 
+ 	newcheck = ~csum_fold((__force __wsum)((__force u32)th->check +
+-					       (__force u32)delta));
++						   (__force u32)delta));
+ 
+ 	do {
+ 		th->fin = th->psh = 0;
+@@ -166,7 +166,7 @@
+ 
+ 	delta = htonl(oldlen + (skb_tail_pointer(skb) -
+ 				skb_transport_header(skb)) +
+-		      skb->data_len);
++			  skb->data_len);
+ 	th->check = ~csum_fold((__force __wsum)((__force u32)th->check +
+ 				(__force u32)delta));
+ 	if (skb->ip_summed != CHECKSUM_PARTIAL)
+@@ -178,48 +178,79 @@
  struct sk_buff **tcp_gro_receive(struct sk_buff **head, struct sk_buff *skb)
  {
  	struct sk_buff **pp = NULL;
@@ -1090,12 +2771,11 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +	__u32 in_seq_next;
  	unsigned int thlen;
  	__be32 flags;
- 	unsigned int mss = 1;
+-	unsigned int mss = 1;
  	unsigned int hlen;
  	unsigned int off;
-+	int merged = 0;
  	int flush = 1;
- 	int i;
+-	int i;
 +	struct sk_buff_head_gro *ofo_queue;
 +	int err;
 +
@@ -1107,22 +2787,36 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
  
  	off = skb_gro_offset(skb);
  	hlen = off + sizeof(*th);
-@@ -198,10 +214,12 @@
- 		if (unlikely(!th))
- 			goto out;
+ 	th = skb_gro_header_fast(skb, off);
+ 	if (skb_gro_header_hard(skb, hlen)) {
+ 		th = skb_gro_header_slow(skb, hlen, off);
+-		if (unlikely(!th))
+-			goto out;
++		if (unlikely(!th)) {
++			NAPI_GRO_CB(skb)->flush = 1;
++			return NULL;
++		}
  	}
 +	//printk(KERN_NOTICE "tcp1\n");
  
  	thlen = th->doff * 4;
- 	if (thlen < sizeof(*th))
- 		goto out;
+-	if (thlen < sizeof(*th))
+-		goto out;
++	if (thlen < sizeof(*th)) {
++		NAPI_GRO_CB(skb)->flush = 1;
++		return NULL;
++	}
 +	//printk(KERN_NOTICE "tcp2\n");
  
  	hlen = off + thlen;
  	if (skb_gro_header_hard(skb, hlen)) {
-@@ -209,17 +227,27 @@
- 		if (unlikely(!th))
- 			goto out;
+ 		th = skb_gro_header_slow(skb, hlen, off);
+-		if (unlikely(!th))
+-			goto out;
++		if (unlikely(!th)) {
++			NAPI_GRO_CB(skb)->flush = 1;
++			return NULL;
++		}
  	}
 +	//printk(KERN_NOTICE "tcp3\n");
  
@@ -1148,49 +2842,62 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
  
  		if (*(u32 *)&th->source ^ *(u32 *)&th2->source) {
  			NAPI_GRO_CB(p)->same_flow = 0;
-@@ -228,45 +256,347 @@
- 
+@@ -229,46 +260,371 @@
  		goto found;
  	}
-+	//printk(KERN_NOTICE "tcp4\n");
  
- 	goto out_check_final;
+-	goto out_check_final;
++	printk(KERN_INFO "queue not found\n");
++	flush = len < 1;
++	flush |= (__force int)(flags & (TCP_FLAG_URG |
++					TCP_FLAG_RST | TCP_FLAG_SYN |
++					TCP_FLAG_FIN));
++	flush |= off < skb_headlen(skb);
++	NAPI_GRO_CB(skb)->flush |= (flush != 0);
++	return NULL;
  
  found:
 +	//printk(KERN_NOTICE "found0\n");
  	/* Include the IP ID check below from the inner most IP hdr */
 -	flush = NAPI_GRO_CB(p)->flush | NAPI_GRO_CB(p)->flush_id;
-+	//printk(KERN_NOTICE "flush-1 %u\n", flush);
-+	//printk(KERN_NOTICE "flush-2 %u\n", NAPI_GRO_CB(p)->flush);
-+	//printk(KERN_NOTICE "flush-3 %u\n", NAPI_GRO_CB(p)->flush_id);
-+	flush = NAPI_GRO_CB(p)->flush; //| NAPI_GRO_CB(p)->flush_id;
-+	if (flush)
-+	printk(KERN_NOTICE "flush0 %u\n", flush);
- 	flush |= (__force int)(flags & TCP_FLAG_CWR);
-+	if (flush)
-+	printk(KERN_NOTICE "flush1 %u\n", flush);
- 	flush |= (__force int)((flags ^ tcp_flag_word(th2)) &
- 		  ~(TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH));
-+	if (flush)
-+	printk(KERN_NOTICE "flush2 %u\n", flush);
- 	flush |= (__force int)(th->ack_seq ^ th2->ack_seq);
+-	flush |= (__force int)(flags & TCP_FLAG_CWR);
+-	flush |= (__force int)((flags ^ tcp_flag_word(th2)) &
+-		  ~(TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH));
+-	flush |= (__force int)(th->ack_seq ^ th2->ack_seq);
 -	for (i = sizeof(*th); i < thlen; i += 4)
 -		flush |= *(u32 *)((u8 *)th + i) ^
 -			 *(u32 *)((u8 *)th2 + i);
+-
+-	mss = tcp_skb_mss(p);
+-
+-	flush |= (len - 1) >= mss;
+-	flush |= (ntohl(th2->seq) + skb_gro_len(p)) ^ ntohl(th->seq);
++	//printk(KERN_NOTICE "flush-1 %u\n", flush);
++	//printk(KERN_NOTICE "flush-2 %u\n", NAPI_GRO_CB(p)->flush);
++	//printk(KERN_NOTICE "flush-3 %u\n", NAPI_GRO_CB(p)->flush_id);
++	flush = NAPI_GRO_CB(p)->flush;
 +	if (flush)
-+	printk(KERN_NOTICE "flush3 %u\n", flush);
++	printk(KERN_NOTICE "flush0 %u\n", flush);
++	flush |= (__force int)(flags & (TCP_FLAG_RST | TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_URG));
++	if (flush)
++	printk(KERN_NOTICE "flush1 %u\n", flush);
++	flush |= off < skb_headlen(skb);
++	if (flush)
++	printk(KERN_NOTICE "flush2 offset %u headlen %u\n", off, skb_headlen(skb));
++	//flush |= (__force int)(th->ack_seq ^ th2->ack_seq);
++	//if (flush)
++	//printk(KERN_NOTICE "flush3 %u\n", flush);
 +	//for (i = sizeof(*th); i < thlen; i += 4)
-+	//	flush |= *(u32 *)((u8 *)th + i) ^
-+	//		 *(u32 *)((u8 *)th2 + i);
++	//	  flush |= *(u32 *)((u8 *)th + i) ^
++	//		   *(u32 *)((u8 *)th2 + i);
 +	//if (flush)
 +	//printk(KERN_NOTICE "flush4 %u\n", flush);
- 
- 	mss = tcp_skb_mss(p);
- 
- 	flush |= (len - 1) >= mss;
--	flush |= (ntohl(th2->seq) + skb_gro_len(p)) ^ ntohl(th->seq);
-+	if (flush)
-+	printk(KERN_NOTICE "flush5 %u %u\n", len, mss);
++
++	//mss = tcp_skb_mss(p);
++
++	//flush |= (len - 1) >= mss;
++	//if (flush)
++	//printk(KERN_NOTICE "flush5 %u %u\n", len, mss);
 +	/* allow out of order packets to be merged latter */
 +	//flush |= (ntohl(th2->seq) + skb_gro_len(p)) ^ ntohl(th->seq);
  
@@ -1198,34 +2905,49 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
  	if (flush || skb_gro_receive(head, skb)) {
  		mss = 1;
  		goto out_check_final;
+-	}
 +	}*/
-+
+ 
+-	p = *head;
+-	th2 = tcp_hdr(p);
+-	tcp_flag_word(th2) |= flags & (TCP_FLAG_FIN | TCP_FLAG_PSH);
+-
+-out_check_final:
+-	flush = len < mss;
+-	flush |= (__force int)(flags & (TCP_FLAG_URG | TCP_FLAG_PSH |
+-					TCP_FLAG_RST | TCP_FLAG_SYN |
+-					TCP_FLAG_FIN));
 +	ofo_queue = NAPI_GRO_CB(p)->out_of_order_queue;
 +	NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
-+	skb_shinfo(skb)->gso_size = mss;
++	skb_shinfo(skb)->gso_size = len;
 +	//printk(KERN_NOTICE "%u\n", flush);
 +	//printk(KERN_NOTICE "%u\n", ofo_queue->qlen);
-+
+ 
+-	if (p && (!NAPI_GRO_CB(skb)->same_flow || flush))
+-		pp = head;
 +	if (flush) {
 +		printk(KERN_NOTICE "flush point 1\n");
 +		NAPI_GRO_CB(skb)->flush = 1;
 +		return head;
 +	}
 +	//printk(KERN_NOTICE "found1\n");
-+
-+	if (before(NAPI_GRO_CB(skb)->seq, ofo_queue->seq_next)) {
-+		printk(KERN_NOTICE "flush point 2\n");
-+		NAPI_GRO_CB(skb)->flush = 1;
-+		return NULL;
- 	}
  
--	p = *head;
--	th2 = tcp_hdr(p);
--	tcp_flag_word(th2) |= flags & (TCP_FLAG_FIN | TCP_FLAG_PSH);
+-out:
+-	NAPI_GRO_CB(skb)->flush |= (flush != 0);
++	if (before(seq, ofo_queue->seq_next)) {
++		if (ofo_queue->flushed) {
++			printk(KERN_NOTICE "flush point 2\n");
++			NAPI_GRO_CB(skb)->flush = 1;
++			return NULL;
++		} else {
++			ofo_queue->seq_next = seq;
++		}
++	}
++
 +	// need to make sure the one in gro_list is always the head of the ofo_queue
 +	//printk(KERN_NOTICE "enqueue\n");
-+	NAPI_GRO_CB(skb)->age = jiffies;
-+	NAPI_GRO_CB(skb)->timestamp = ktime_to_ns(ktime_get());
++	//NAPI_GRO_CB(skb)->age = jiffies;
++	//NAPI_GRO_CB(skb)->timestamp = ktime_to_ns(ktime_get());
 +	p2 = NAPI_GRO_CB(p)->out_of_order_queue->next;
 +	p_next = p->next;
 +	in_seq_next = ofo_queue->seq_next;
@@ -1246,32 +2968,46 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +
 +		if (before(seq_next, seq2)) {
 +			//printk(KERN_NOTICE "enqueue0\n");
-+			NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
-+			NAPI_GRO_CB(skb)->prev = NAPI_GRO_CB(p2)->prev;
-+			NAPI_GRO_CB(skb)->next = p2;
-+			ofo_queue->qlen += len;
-+			ofo_queue->skb_num++;
-+			if (NAPI_GRO_CB(p2)->prev == NULL) {
-+				ofo_queue->next = skb;
-+				NAPI_GRO_CB(p2)->prev = skb;
-+
-+				*head = skb;
-+				skb->next = p_next;
++			if ((flags & TCP_FLAG_PSH) && (seq == in_seq)) {
++				p3 = NAPI_GRO_CB(p2)->prev;
++				if (p3 != NULL) {
++					*head = p2;
++					p2->next = p_next;
++					skb_gro_flush(ofo_queue, p3);
++					printk(KERN_INFO "flush point 100\n");
++				}
++				NAPI_GRO_CB(skb)->flush = 1;
++				return NULL;
 +			} else {
-+				NAPI_GRO_CB(NAPI_GRO_CB(p2)->prev)->next = skb;
-+				NAPI_GRO_CB(p2)->prev = skb;
-+			}
++				NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
++				NAPI_GRO_CB(skb)->prev = NAPI_GRO_CB(p2)->prev;
++				NAPI_GRO_CB(skb)->next = p2;
++				ofo_queue->qlen += len;
++				ofo_queue->skb_num++;
++				if (NAPI_GRO_CB(p2)->prev == NULL) {
++					ofo_queue->next = skb;
++					NAPI_GRO_CB(p2)->prev = skb;
 +
-+			merged = 1;
-+			NAPI_GRO_CB(skb)->same_flow = 1;
-+			break;
++					*head = skb;
++					skb->next = p_next;
++				} else {
++					NAPI_GRO_CB(NAPI_GRO_CB(p2)->prev)->next = skb;
++					NAPI_GRO_CB(p2)->prev = skb;
++				}
++
++				NAPI_GRO_CB(skb)->same_flow = 1;
++				return NULL;
++			}
 +
 +		} else if (seq_next == seq2) {
 +			//printk(KERN_NOTICE "enqueue1\n");
 +
 +			if ((err = skb_gro_merge(skb, p2))) {
-+
-+				if (err == -E2BIG && in_seq != seq) {
++				if (err == SKB_MERGE_INVAL) {
++					printk(KERN_NOTICE "flush point 140\n");
++					NAPI_GRO_CB(skb)->flush = 1;
++					return head;
++				} else if (in_seq != seq) {
 +					NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
 +					NAPI_GRO_CB(skb)->prev = NAPI_GRO_CB(p2)->prev;
 +					NAPI_GRO_CB(skb)->next = p2;
@@ -1288,31 +3024,42 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +						NAPI_GRO_CB(p2)->prev = skb;
 +					}
 +
-+					merged = 1;
 +					NAPI_GRO_CB(skb)->same_flow = 1;
-+					break;
++					return NULL;
 +
-+				} else {
++				} else if (err == SKB_MERGE_2BIG || tcp_hdr(p2)->psh || NAPI_GRO_CB(p2)->gso_end) {
 +					printk(KERN_NOTICE "flush point 3\n");
 +					p3 = NAPI_GRO_CB(p2)->next;
 +					if (p3 != NULL) {
++						printk(KERN_NOTICE "flush point 31\n");
 +						*head = p3;
 +						p3->next = p_next;
 +						skb_gro_flush(ofo_queue, p2);
 +						NAPI_GRO_CB(skb)->flush = 1;
 +						return NULL;
 +					} else {
++						printk(KERN_NOTICE "flush point 32\n");
 +						NAPI_GRO_CB(skb)->flush = 1;
 +						return head;
 +					}
++				} else {
++					printk(KERN_NOTICE "flush point 30\n");
++					p3 = NAPI_GRO_CB(p2)->prev;
++					if (p3 != NULL) {
++						*head = p2;
++						p2->next = p_next;
++						skb_gro_flush(ofo_queue, p3);
++					}
++					NAPI_GRO_CB(skb)->flush = 1;
++					return NULL;
 +				}
 +			}
 +
 +			NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
 +			NAPI_GRO_CB(skb)->prev = NAPI_GRO_CB(p2)->prev;
 +			NAPI_GRO_CB(skb)->next = NAPI_GRO_CB(p2)->next;
-+			NAPI_GRO_CB(skb)->age = NAPI_GRO_CB(p2)->age;
-+			NAPI_GRO_CB(skb)->timestamp = NAPI_GRO_CB(p2)->timestamp;
++			//NAPI_GRO_CB(skb)->age = NAPI_GRO_CB(p2)->age;
++			//NAPI_GRO_CB(skb)->timestamp = NAPI_GRO_CB(p2)->timestamp;
 +			ofo_queue->qlen += len;
 +
 +			if (NAPI_GRO_CB(p2)->prev == NULL) {
@@ -1332,7 +3079,6 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +
 +			skb_gro_free(p2);
 +
-+			merged = 1;
 +			NAPI_GRO_CB(skb)->same_flow = 1;
 +			break;
 +
@@ -1341,7 +3087,7 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +
 +			if ((err = skb_gro_merge(p2, skb))) {
 +
-+				if (err == -E2BIG) {
++				if (err != SKB_MERGE_INVAL) {
 +					p3 = NAPI_GRO_CB(p2)->next;
 +					if (p3 != NULL) {
 +						if (in_seq == seq2) {
@@ -1353,6 +3099,12 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +						p2 = p3;
 +						continue;
 +					} else {
++						if (in_seq == seq2 && th->psh) {
++							printk(KERN_NOTICE "flush point 110\n");
++							NAPI_GRO_CB(skb)->flush = 1;
++							return head;
++						}
++
 +						NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;
 +						NAPI_GRO_CB(skb)->prev = p2;
 +						NAPI_GRO_CB(skb)->next = NULL;
@@ -1362,8 +3114,7 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +
 +						NAPI_GRO_CB(p2)->next = skb;
 +						ofo_queue->prev = skb;
-+						
-+						merged = 1;
++
 +						NAPI_GRO_CB(skb)->same_flow = 1;
 +
 +						if (in_seq == seq2) {
@@ -1373,39 +3124,39 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +							skb_gro_flush(ofo_queue, p2);
 +						}
 +
-+						break;
++						return NULL;
 +					}
++
 +				} else {
 +					printk(KERN_NOTICE "flush point 4\n");
-+					p3 = NAPI_GRO_CB(p2)->next;
-+					if (p3 != NULL) {
-+						*head = p3;
-+						p3->next = p_next;
-+						skb_gro_flush(ofo_queue, p2);
-+						NAPI_GRO_CB(skb)->flush = 1;
-+						return NULL;
-+					} else {
-+						NAPI_GRO_CB(skb)->flush = 1;
-+						return head;
-+					}
++					NAPI_GRO_CB(skb)->flush = 1;
++					return head;
 +				}
 +			}
 +
-+			th2 = tcp_hdr(p2);
-+			tcp_flag_word(th2) |= flags & (TCP_FLAG_FIN | TCP_FLAG_PSH);
-+
-+			//skb_gro_free(skb);
-+
 +			ofo_queue->qlen += len;
-+
++			th2 = tcp_hdr(p2);
 +			p3 = NAPI_GRO_CB(p2)->next;
++			if (in_seq == seq2 && th2->psh) {
++				if (p3 == NULL) {
++					printk(KERN_NOTICE "flush point 120\n");
++					return head;
++				} else {
++					printk(KERN_NOTICE "flush point 101\n");
++					*head = p3;
++					p3->next = p_next;
++					skb_gro_flush(ofo_queue, p2);
++					return NULL;
++				}
++			}
++
 +			if (p3 != NULL) {
 +
 +				if (seq_next == NAPI_GRO_CB(p3)->seq) {
 +
 +					//printk(KERN_NOTICE "merge p3\n");
 +					if ((err = skb_gro_merge(p2, p3))) {
-+						if (err == -E2BIG) {
++						if (err != SKB_MERGE_INVAL) {
 +							if (in_seq == seq2) {
 +								printk(KERN_NOTICE "flush point 50\n");
 +								*head = p3;
@@ -1416,30 +3167,36 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +						} else {
 +							//printk(KERN_NOTICE "merge fail\n");
 +							printk(KERN_NOTICE "flush point 5\n");
-+							p4 = NAPI_GRO_CB(p3)->next;
-+							if (p4 != NULL) {
-+								*head = p4;
-+								p4->next = p_next;
-+								skb_gro_flush(ofo_queue, p3);
-+								return NULL;
-+							} else {
-+								return head;
-+							}
++							return head;
 +						}
 +					}
 +
-+					ofo_queue->skb_num--;	
++					ofo_queue->skb_num--;
 +
 +					NAPI_GRO_CB(p2)->next = NAPI_GRO_CB(p3)->next;
-+					NAPI_GRO_CB(p2)->age = min(NAPI_GRO_CB(p2)->age, NAPI_GRO_CB(p3)->age);
-+					NAPI_GRO_CB(p2)->timestamp = min(NAPI_GRO_CB(p2)->timestamp, NAPI_GRO_CB(p3)->timestamp);
-+					
-+					skb_gro_free(p3);	
++					//NAPI_GRO_CB(p2)->age = min(NAPI_GRO_CB(p2)->age, NAPI_GRO_CB(p3)->age);
++					//NAPI_GRO_CB(p2)->timestamp = min(NAPI_GRO_CB(p2)->timestamp, NAPI_GRO_CB(p3)->timestamp);
++
++					skb_gro_free(p3);
 +
 +					if (NAPI_GRO_CB(p2)->next == NULL) {
 +						ofo_queue->prev = p2;
 +					} else {
 +						NAPI_GRO_CB(NAPI_GRO_CB(p2)->next)->prev = p2;
++					}
++
++					p3 = NAPI_GRO_CB(p2)->next;
++					if (in_seq == seq2 && th2->psh) {
++						if (p3 == NULL) {
++							printk(KERN_NOTICE "flush point 130\n");
++							return head;
++						} else {
++							printk(KERN_NOTICE "flush point 102\n");
++							*head = p3;
++							p3->next = p_next;
++							skb_gro_flush(ofo_queue, p2);
++							return NULL;
++						}
 +					}
 +
 +				} else if (after(seq_next, NAPI_GRO_CB(p3)->seq)) {
@@ -1449,8 +3206,7 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +
 +			}
 +
-+			merged = 1;
-+			break;
++			return NULL;
 +
 +		} else if (after(seq, seq_next2)) {
 +			//printk(KERN_NOTICE "enqueue3\n");
@@ -1466,7 +3222,6 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +				ofo_queue->prev = skb;
 +				NAPI_GRO_CB(p2)->next = skb;
 +
-+				merged = 1;
 +				NAPI_GRO_CB(skb)->same_flow = 1;
 +				break;
 +
@@ -1483,28 +3238,49 @@ diff -Naur linux-3.18.5/net/ipv4/tcp_offload.c linux-3.18.5-juggler/net/ipv4/tcp
 +		}
 +	}
  
- out_check_final:
-+	//printk(KERN_NOTICE "%u\n", len);
-+	//printk(KERN_NOTICE "%u\n", mss);
- 	flush = len < mss;
--	flush |= (__force int)(flags & (TCP_FLAG_URG | TCP_FLAG_PSH |
--					TCP_FLAG_RST | TCP_FLAG_SYN |
--					TCP_FLAG_FIN));
-+	//flush |= (__force int)(flags & (TCP_FLAG_URG | TCP_FLAG_PSH |
-+	//				TCP_FLAG_RST | TCP_FLAG_SYN |
-+	//				TCP_FLAG_FIN));
- 
--	if (p && (!NAPI_GRO_CB(skb)->same_flow || flush))
-+	if (p && (!merged || flush)) {
-+		printk(KERN_NOTICE "flush point 9\n");
- 		pp = head;
-+	}
- 
- out:
-+	//printk(KERN_NOTICE "%x\n", NAPI_GRO_CB(skb)->flush);
- 	NAPI_GRO_CB(skb)->flush |= (flush != 0);
-+	//printk(KERN_NOTICE "%x\n", NAPI_GRO_CB(skb)->flush);
-+	//printk(KERN_NOTICE "%x\n", pp);
- 
- 	return pp;
+-	return pp;
++	return NULL;
  }
+ 
+ int tcp_gro_complete(struct sk_buff *skb)
+@@ -292,8 +648,8 @@
+ {
+ 	/* Don't bother verifying checksum if we're going to flush anyway. */
+ 	if (!NAPI_GRO_CB(skb)->flush &&
+-	    skb_gro_checksum_validate(skb, IPPROTO_TCP,
+-				      inet_gro_compute_pseudo)) {
++		skb_gro_checksum_validate(skb, IPPROTO_TCP,
++					  inet_gro_compute_pseudo)) {
+ 		NAPI_GRO_CB(skb)->flush = 1;
+ 		return NULL;
+ 	}
+diff -Naur linux-4.1.32/net/ipv4/.tcp_offload.c.swp linux-4.1.32-juggler/net/ipv4/.tcp_offload.c.swp
+--- linux-4.1.32/net/ipv4/.tcp_offload.c.swp	1970-01-01 08:00:00.000000000 +0800
++++ linux-4.1.32-juggler/net/ipv4/.tcp_offload.c.swp	2016-09-09 06:12:15.549823145 +0800
+@@ -0,0 +1,25 @@
++b0VIM 7.3      ¶I1V$É  gengyl08                                Yilongs-MacBook-Air.local               ~gengyl08/GoogleDrive/Stanford/BalajiGroup/packet_reordering/linux-4.1/net/ipv4/tcp_offload.c                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      3210    #"! U                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 tp           ì                     ˇˇˇˇˇˇˇˇâ       î              ˛ˇˇˇˇˇˇˇ}                    ˝ˇˇˇˇˇˇˇè       ö             ¸ˇˇˇˇˇˇˇÑ       )                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ad     u     ì       ˝  ›  ¿  Ω  |  =  ˝  ¡  æ  •  °  †  Ü  q  W  V    Á  Â  ÷  ≥  Ç  ^  S  O  N  ;  -  *  (  '  Í  …  «  ñ  {  z  E    ¯  ˜  ª  û  ò  ó  Ü  a  -  *  )    ˇ
++  ˛
++  …
++  ©
++  ß
++  }
++  ]
++  I
++  4
++  !
++  
++  ¸	  È	  …	  ∂	  ï	  î	  Ä	  i	  O	  C	  B	  !	  	  	  ˙  ·  ‡  «  ß  õ  ö  c  '  ˇ  ˛  Ë  —  ∫  °  ä  u  [  E  0    Û  ”  ∆  ï  à  á  L  K  <  0  -  ,  ˜  ÿ  ô  Ö  Ñ  `  M  A  @    Ú  Ò  …  »  ª  ß  ê  è  O      œ  ∞  Ø  ©  ê  x  w  M        Ú  »  Æ  å  à  u  t               		skb = skb->next; 		} 			sum_truesize += skb->truesize; 			skb->sk = gso_skb->sk; 			skb->destructor = gso_skb->destructor; 		if (copy_destructor) { 		seq += mss;  			th->check = gso_make_checksum(skb, ~th->check); 		if (skb->ip_summed != CHECKSUM_PARTIAL)  		th->check = newcheck; 		th->fin = th->psh = 0; 	do {  						   (__force u32)delta)); 	newcheck = ~csum_fold((__force __wsum)((__force u32)th->check +  		tcp_gso_tstamp(segs, skb_shinfo(gso_skb)->tskey, seq, mss); 	if (unlikely(skb_shinfo(gso_skb)->tx_flags & SKBTX_SW_TSTAMP))  	seq = ntohl(th->seq); 	th = tcp_hdr(skb); 	skb = segs;  	delta = htonl(oldlen + (thlen + mss));  	segs->ooo_okay = ooo_okay; 	/* Only first segment might have ooo_okay set */  		goto out; 	if (IS_ERR(segs)) 	segs = skb_segment(skb, features);  	skb->ooo_okay = 0; 	/* All segments but the first should have ooo_okay cleared */ 	ooo_okay = gso_skb->ooo_okay; 	copy_destructor = gso_skb->destructor == tcp_wfree;  	} 		goto out; 		segs = NULL;  		skb_shinfo(skb)->gso_segs = DIV_ROUND_UP(skb->len, mss);  			goto out; 				 !(type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6)))) 				   0) || 				   SKB_GSO_TUNNEL_REMCSUM | 				   SKB_GSO_UDP_TUNNEL_CSUM | 				   SKB_GSO_UDP_TUNNEL | 				   SKB_GSO_SIT | 				   SKB_GSO_IPIP | 				   SKB_GSO_GRE_CSUM | 				   SKB_GSO_GRE | 				   SKB_GSO_TCPV6 | 				   SKB_GSO_TCP_ECN | 				   SKB_GSO_DODGY | 				 ~(SKB_GSO_TCPV4 | 		if (unlikely(type &  		int type = skb_shinfo(skb)->gso_type; 		/* Packet is from an untrusted source, reset gso_segs. */ 	if (skb_gso_ok(skb, features | NETIF_F_GSO_ROBUST)) {  		goto out; 	if (unlikely(skb->len <= mss)) 	mss = tcp_skb_mss(skb);  	__skb_pull(skb, thlen); 	oldlen = (u16)~skb->len;  		goto out; 	if (!pskb_may_pull(skb, thlen))  		goto out; 	if (thlen < sizeof(*th)) 	thlen = th->doff * 4; 	th = tcp_hdr(skb);  	bool ooo_okay, copy_destructor; 	__sum16 newcheck; 	struct sk_buff *gso_skb = skb; 	unsigned int mss; 	unsigned int oldlen; 	__be32 delta; 	unsigned int seq; 	unsigned int thlen; 	struct tcphdr *th; 	unsigned int sum_truesize = 0; 	struct sk_buff *segs = ERR_PTR(-EINVAL); { 				netdev_features_t features) struct sk_buff *tcp_gso_segment(struct sk_buff *skb,  } 	return tcp_gso_segment(skb, features);  	} 		__tcp_v4_send_check(skb, iph->saddr, iph->daddr); 		skb->ip_summed = CHECKSUM_PARTIAL; 		th->check = 0;  		 */ 		 * have done this already. 		/* Set up checksum pseudo header, usually expect stack to  		struct tcphdr *th = tcp_hdr(skb); 		const struct iphdr *iph = ip_hdr(skb); 	if (unlikely(skb->ip_summed != CHECKSUM_PARTIAL)) {  		return ERR_PTR(-EINVAL); 	if (!pskb_may_pull(skb, sizeof(struct tcphdr))) { 					netdev_features_t features) static struct sk_buff *tcp4_gso_segment(struct sk_buff *skb,  } 	} 		seq += mss; 		skb = skb->next;  		} 			return; 			skb_shinfo(skb)->tskey = ts_seq; 			skb_shinfo(skb)->tx_flags |= SKBTX_SW_TSTAMP; 		if (before(ts_seq, seq + mss)) { 	while (skb) { { 			   unsigned int seq, unsigned int mss) static void tcp_gso_tstamp(struct sk_buff *skb, unsigned int ts_seq,  #include <net/protocol.h> #include <net/tcp.h> #include <linux/skbuff.h>   */  *	TCPv4 GSO/GRO support  *  *	2 of the License, or (at your option) any later version.  *	as published by the Free Software Foundation; either version  *	modify it under the terms of the GNU General Public License  *	This program is free software; you can redistribute it and/or  *  *	Linux INET implementation  *	IPV4 GSO/GRO offload support /* ad     ,     Ñ       Ï  ›  ∞  Ç  n  f  _  ^  C  B    ø  ^  ]  F  E    ˇ  Ò  º  µ  ¥  ì  l  T  $      —  æ  §    k  c  \  [  #  ˜  Â  ﬂ  ﬁ  Ÿ  ÿ  »  «  °  z  y  Q  P    ˘
++  ÷
++  ’
++  π
++  ü
++  Ñ
++  c
++  b
++  =
++  2
++  1
++  %
++  
++  ˜	  Ú	  Ò	  Ê	  ø	  ï	  u	  e	  a	  ^	  ]	  O	  M	  L	  "	   	  ˝  ¸  »  î  p  o  9  8  *  ˙  ˘  Ó  Ï  À     ~  |  5    Ê  √  §  ï  í  ë  m  k  j  -  +    ‡  ﬂ  ¶  ê  c  b  C  A  @    ˛  €  ∏  ì  è  å  ã  g  e  .  ,  +                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  } 	return inet_add_offload(&tcpv4_offload, IPPROTO_TCP); { int __init tcpv4_offload_init(void)  }; 	}, 		.gro_complete	=	tcp4_gro_complete, 		.gro_receive	=	tcp4_gro_receive, 		.gso_segment	=	tcp4_gso_segment, 	.callbacks = { static const struct net_offload tcpv4_offload = {  } 	return tcp_gro_complete(skb);  	skb_shinfo(skb)->gso_type |= SKB_GSO_TCPV4; 				  iph->daddr, 0); 	th->check = ~tcp_v4_check(skb->len - thoff, iph->saddr,  	struct tcphdr *th = tcp_hdr(skb); 	const struct iphdr *iph = ip_hdr(skb); { static int tcp4_gro_complete(struct sk_buff *skb, int thoff)  } 	return tcp_gro_receive(napi, skb);  	} 		return NULL; 		NAPI_GRO_CB(skb)->flush = 1; 					  inet_gro_compute_pseudo)) { 		skb_gro_checksum_validate(skb, IPPROTO_TCP, 	if (!NAPI_GRO_CB(skb)->flush && 	/* Don't bother verifying checksum if we're going to flush anyway. */ { static bool tcp4_gro_receive(struct napi_struct *napi, struct sk_buff *skb)  EXPORT_SYMBOL(tcp_gro_complete); } 	return 0;  		skb_shinfo(skb)->gso_type |= SKB_GSO_TCP_ECN; 	if (th->cwr)  	skb_shinfo(skb)->gso_segs = NAPI_GRO_CB(skb)->count;  	skb->ip_summed = CHECKSUM_PARTIAL; 	skb->csum_offset = offsetof(struct tcphdr, check); 	skb->csum_start = (unsigned char *)th - skb->head;  	struct tcphdr *th = tcp_hdr(skb); { int tcp_gro_complete(struct sk_buff *skb)  } 	return NULL;  	} 		} 			return head; 			NAPI_GRO_CB(skb)->flush = 1; 			printk(KERN_NOTICE "flush point 8\n"); 			//printk(KERN_NOTICE "enqueue4\n"); 		} else {  			} 				continue; 				p2 = NAPI_GRO_CB(p2)->next; 			} else {  				break; 				NAPI_GRO_CB(skb)->same_flow = 1;  				NAPI_GRO_CB(p2)->next = skb; 				ofo_queue->prev = skb; 				ofo_queue->skb_num++; 				ofo_queue->qlen += len;  				NAPI_GRO_CB(skb)->next = NULL; 				NAPI_GRO_CB(skb)->prev = p2; 				NAPI_GRO_CB(skb)->out_of_order_queue = ofo_queue;  			if (NAPI_GRO_CB(p2)->next == NULL) {  			//printk(KERN_NOTICE "enqueue3\n"); 		} else if (after(seq, seq_next2)) {  			return NULL;  			}  				} 					return head; 					printk(KERN_NOTICE "flush point 7\n"); 				} else if (after(seq_next, NAPI_GRO_CB(p3)->seq)) {  					} 						} 							return NULL; 							skb_gro_flush(ofo_queue, p2); 							p3->next = p_next; 							*head = p3; 							printk(KERN_NOTICE "flush point 102\n"); 						} else { 							return head; 							printk(KERN_NOTICE "flush point 130\n"); 						if (p3 == NULL) { 					if (in_seq == seq2 && th2->psh) { 					p3 = NAPI_GRO_CB(p2)->next;  					} 						NAPI_GRO_CB(NAPI_GRO_CB(p2)->next)->prev = p2; 					} else { 						ofo_queue->prev = p2; 					if (NAPI_GRO_CB(p2)->next == NULL) {  					skb_gro_free(p3);  					//NAPI_GRO_CB(p2)->timestamp = min(NAPI_GRO_CB(p2)->timestamp, NAPI_GRO_CB(p3)->timestamp); 					//NAPI_GRO_CB(p2)->age = min(NAPI_GRO_CB(p2)->age, NAPI_GRO_CB(p3)->age); 					NAPI_GRO_CB(p2)->next = NAPI_GRO_CB(p3)->next;  					ofo_queue->skb_num--;  					} 						} 							return head; 							printk(KERN_NOTICE "flush point 5\n"); 							//printk(KERN_NOTICE "merge fail\n"); 						} else { 							return NULL; 
+\ No newline at end of file
